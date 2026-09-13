@@ -1,0 +1,20 @@
+"""Frozen 22-column contract for ``expanded.csv``.
+
+See ``docs/contracts/expanded.md``.
+"""
+from __future__ import annotations
+
+EXPANDED_HEADER_COLUMNS: list[str] = [
+    "NAMESPACE", "PARENT_TYPE", "PARENT_NAME",
+    "REPOSITORY", "DIGEST", "TAG", "CVE_ID",
+    "CVSS_SCORE", "SEVERITY",
+    "PACKAGE_CATEGORY", "PACKAGE_LANGUAGE", "PACKAGE_NAME",
+    "CURRENT_VERSION", "FIXED_VERSION", "PATCHABLE",
+    "REMEDIATION", "FIX_STATUS", "CVE_AGE_DAYS",
+    "IS_IN_EXPLOIT_KIT", "HAS_PUBLISHED_EXPLOIT", "HAS_VERIFIED_EXPLOIT",
+    "LAST_PUSHED_TO_REGISTRY_UTC",
+]
+
+EXPANDED_COLUMN_COUNT: int = 22
+
+assert len(EXPANDED_HEADER_COLUMNS) == EXPANDED_COLUMN_COUNT

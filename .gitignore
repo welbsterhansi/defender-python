@@ -1,0 +1,33 @@
+# Local agent configuration — never commit
+claude.md
+CLAUDE.md
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Coverage + browser caches (local only)
+.coverage
+.coverage.*
+htmlcov/
+.playwright-mcp/
+
+# Generated artifacts (regenerated per run)
+scan.csv
+cluster.csv
+expand.csv
+*.log
+
+# macOS
+.DS_Store
+
+# Local planning notes
+NOTES.md
+logs/
