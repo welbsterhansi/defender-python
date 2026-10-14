@@ -447,6 +447,52 @@ class TestScanOrchestrator:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# ResourceGraphClient — SDK plumbing (api-version)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestResourceGraphClientApiVersion:
+    """Guards against the regression where ``Config.arg_api_version`` was
+    defined but never forwarded to the SDK — leaving the pipeline on the
+    SDK default (2021-03-01), under which ``microsoft.security/cvedetails``
+    omits ``exploitabilityDetails`` and exploit flags silently zero out."""
+
+    def test_default_config_pins_api_version_2022_10_01(self) -> None:
+        from defender_pipeline.azure.resource_graph import ResourceGraphClient
+
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            ResourceGraphClient(credential=MagicMock())
+
+        sdk_mock.assert_called_once()
+        _, kwargs = sdk_mock.call_args
+        assert kwargs.get("api_version") == "2022-10-01"
+
+    def test_explicit_config_is_forwarded(self) -> None:
+        from defender_pipeline.azure.resource_graph import ResourceGraphClient
+        from defender_pipeline.config import Config
+
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            ResourceGraphClient(
+                credential=MagicMock(), config=Config(),
+            )
+
+        _, kwargs = sdk_mock.call_args
+        assert kwargs.get("api_version") == "2022-10-01"
+
+    def test_custom_api_version_overrides_default(self) -> None:
+        """Operators can override via Config without editing the client."""
+        from defender_pipeline.azure.resource_graph import ResourceGraphClient
+        from defender_pipeline.config import Config
+
+        custom = Config(arg_api_version="2024-04-01")
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            ResourceGraphClient(credential=MagicMock(), config=custom)
+
+        _, kwargs = sdk_mock.call_args
+        assert kwargs.get("api_version") == "2024-04-01"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # CLI scan subcommand — mocked run_scan
 # ═══════════════════════════════════════════════════════════════════════════
 

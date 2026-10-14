@@ -19,6 +19,7 @@ import logging
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
+from defender_pipeline.config import Config
 from defender_pipeline.utils.batching import BatchTooComplex
 from defender_pipeline.utils.retry import TransientARGError, arg_call_retry
 
@@ -39,10 +40,16 @@ class ResourceGraphClient:
         self,
         credential: TokenCredential,
         *,
+        config: Config | None = None,
         subscription_ids: list[str] | None = None,
     ) -> None:
         from azure.mgmt.resourcegraph import ResourceGraphClient as _SdkClient
-        self._client = _SdkClient(credential)
+        # The SDK's enlatado default is 2021-03-01, under which
+        # microsoft.security/cvedetails may omit exploitabilityDetails
+        # and silently zero out exploit flags — pin to the validated
+        # api-version from Config (2022-10-01).
+        config = config or Config()
+        self._client = _SdkClient(credential, api_version=config.arg_api_version)
         self._subscription_ids = subscription_ids
 
     @arg_call_retry
