@@ -272,6 +272,50 @@ class TestEnrichMerge:
         assert findings[0].cvss_score == "8.1"
         assert findings[0].severity == "High"
 
+    def test_exploit_flags_or_between_enrichment_and_inline(self) -> None:
+        """Regression guard — see erros.md.
+
+        When ARG runs with the SDK's enlatado api-version (2021-03-01),
+        ``microsoft.security/cvedetails`` may omit
+        ``exploitabilityDetails``. The KQL enrichment then emits
+        ``false`` for all three exploit chips via ``iff(isnull, false,
+        ...)``. Before the fix, enrichment overrode inline so the real
+        positives from the assessment row disappeared from the CSV.
+        After the fix, we OR the two sources — any positive wins.
+        """
+        from defender_pipeline.findings.enrich import merge
+        assessment = _mk_assessment(
+            inline_severity="High", inline_cvss_base=8.1,
+            inline_in_exploit_kit="true",
+            inline_publicly_disclosed="true",
+            inline_verified="true",
+        )
+        # Enrichment present but exploit flags all zero (older-API shape).
+        enrichment = {"CVE-2024-1": _mk_enrichment(
+            cvss=9.8, severity="Critical",
+            verified=0, publicly_disclosed=0, in_exploit_kit=0,
+        )}
+        findings = merge([assessment], enrichment, {}, min_score=0, max_score=10)
+        assert len(findings) == 1
+        assert findings[0].is_in_exploit_kit == "true"
+        assert findings[0].has_published_exploit == "true"
+        assert findings[0].has_verified_exploit == "true"
+        # CVSS/severity still follow enrichment-wins policy.
+        assert findings[0].cvss_score == "9.8"
+        assert findings[0].severity == "Critical"
+
+    def test_exploit_flags_both_false_stay_false(self) -> None:
+        """If neither source reports an exploit, the chip is 'false'."""
+        from defender_pipeline.findings.enrich import merge
+        assessment = _mk_assessment()  # all inline exploit fields empty
+        enrichment = {"CVE-2024-1": _mk_enrichment(
+            verified=0, publicly_disclosed=0, in_exploit_kit=0,
+        )}
+        findings = merge([assessment], enrichment, {}, min_score=0, max_score=10)
+        assert findings[0].is_in_exploit_kit == "false"
+        assert findings[0].has_published_exploit == "false"
+        assert findings[0].has_verified_exploit == "false"
+
     def test_min_score_filter_drops_row(self) -> None:
         from defender_pipeline.findings.enrich import merge
         assessment = _mk_assessment(inline_severity="Low")  # cvss ~= 0.1
