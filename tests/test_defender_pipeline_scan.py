@@ -537,6 +537,116 @@ class TestResourceGraphClientApiVersion:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# _translate_arg_error — ARG exception hardening
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestTranslateArgError:
+    """Guard against regressions in the substring-free detection of
+    ``UnexpectedQueryExecutionError``. If the SDK wraps the message
+    differently (localization, versioning), ``_translate_arg_error``
+    must still catch the structured code path and raise BatchTooComplex
+    — otherwise too-complex batches stop splitting and runs fail."""
+
+    def _fake_exc(self, *, status_code=400, code=None, details=None, message=""):
+        """Build a minimal Azure-SDK-shaped exception. Plain classes
+        (not MagicMock) so ``__str__`` and attribute shape are honest."""
+        class _Error:
+            pass
+
+        class _Exc(Exception):
+            def __init__(self):
+                super().__init__(message)
+            def __str__(self):
+                return message
+
+        exc = _Exc()
+        exc.status_code = status_code
+        if code is not None or details is not None:
+            err = _Error()
+            err.code = code
+            err.details = details or []
+            exc.error = err
+        else:
+            exc.error = None
+        return exc
+
+    def _detail(self, code: str):
+        """ODataV4Format-shaped detail (has .code attribute)."""
+        class _D:
+            pass
+        d = _D()
+        d.code = code
+        return d
+
+    def test_detects_too_complex_in_top_level_code(self) -> None:
+        from defender_pipeline.azure.resource_graph import (
+            BatchTooComplex,
+            _translate_arg_error,
+        )
+        exc = self._fake_exc(code="UnexpectedQueryExecutionError")
+        with pytest.raises(BatchTooComplex):
+            _translate_arg_error(exc)
+
+    def test_detects_too_complex_in_nested_details(self) -> None:
+        """ARG actually returns code='InternalServerError' at the top
+        and the real code inside details — this is the common path."""
+        from defender_pipeline.azure.resource_graph import (
+            BatchTooComplex,
+            _translate_arg_error,
+        )
+        exc = self._fake_exc(
+            code="InternalServerError",
+            details=[self._detail("UnexpectedQueryExecutionError")],
+            message="opaque",
+        )
+        with pytest.raises(BatchTooComplex):
+            _translate_arg_error(exc)
+
+    def test_detects_too_complex_in_dict_shaped_details(self) -> None:
+        """Some SDK paths leave details as plain dicts, not ODataV4Format."""
+        from defender_pipeline.azure.resource_graph import (
+            BatchTooComplex,
+            _translate_arg_error,
+        )
+        exc = self._fake_exc(
+            code="InternalServerError",
+            details=[{"code": "UnexpectedQueryExecutionError"}],
+            message="opaque",
+        )
+        with pytest.raises(BatchTooComplex):
+            _translate_arg_error(exc)
+
+    def test_substring_fallback_for_rewrapped_errors(self) -> None:
+        """If the SDK ever drops the structured .error payload, we
+        still detect via substring on str(exc)."""
+        from defender_pipeline.azure.resource_graph import (
+            BatchTooComplex,
+            _translate_arg_error,
+        )
+        exc = self._fake_exc(
+            message="(InternalServerError) UnexpectedQueryExecutionError",
+        )
+        with pytest.raises(BatchTooComplex):
+            _translate_arg_error(exc)
+
+    def test_transient_mapping_still_works(self) -> None:
+        from defender_pipeline.azure.resource_graph import _translate_arg_error
+        from defender_pipeline.utils.retry import TransientARGError
+        exc = self._fake_exc(status_code=503, message="service unavailable")
+        with pytest.raises(TransientARGError):
+            _translate_arg_error(exc)
+
+    def test_terminal_errors_propagate(self) -> None:
+        """4xx that isn't too-complex and isn't 408/429 — let the SDK
+        exception bubble up unchanged. _translate_arg_error returns
+        normally; the caller then re-raises the original."""
+        from defender_pipeline.azure.resource_graph import _translate_arg_error
+        exc = self._fake_exc(status_code=403, message="forbidden")
+        _translate_arg_error(exc)  # does not raise — caller handles
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # CLI scan subcommand — mocked run_scan
 # ═══════════════════════════════════════════════════════════════════════════
 
