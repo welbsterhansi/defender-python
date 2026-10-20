@@ -52,11 +52,24 @@ OUTPUT_HEADER = [
 # value per group wins" — Defender may report the same CVE from multiple
 # subassessments with slightly different metadata; picking the latest
 # populated one is a good enough heuristic and matches the prior inline behavior.
+# Per-CVE/per-package fields carried over with "last non-empty value wins".
+# Known limitation (CLAUDE.md ISSUE-001): these are semantically per-CVE and
+# cannot be summarised faithfully as a single group value — expanded.csv is
+# authoritative. Decision on how to surface this in the grouped CSV is NEEDS
+# APPROVAL and deliberately out of scope here.
 CARRIED_FIELDS = (
     "packageCategory", "packageLanguage", "packageName",
     "currentVersion", "fixedVersion", "patchable",
-    "fixStatus", "cveAgeDays", "isInExploitKit",
-    "hasPublishedExploit", "hasVerifiedExploit", "lastPushedToRegistryUTC",
+    "fixStatus", "cveAgeDays", "lastPushedToRegistryUTC",
+)
+
+# Exploit flags — risk-prioritisation signal. Aggregated with boolean-OR
+# across all CVEs in the group: value is "true" iff ANY CVE in the group is
+# "true". Previously these rode CARRIED_FIELDS and "false" (truthy string)
+# clobbered an earlier "true", producing order-dependent false negatives
+# (CLAUDE.md ISSUE-001).
+EXPLOIT_FLAG_FIELDS = (
+    "isInExploitKit", "hasPublishedExploit", "hasVerifiedExploit",
 )
 
 
@@ -70,10 +83,9 @@ def _new_group() -> dict[str, Any]:
         "tag": "N/A",
         "remediation": "",
         **{col: "" for col in CARRIED_FIELDS},
-        # Exploit flags default to "false" (matches Defender's convention).
-        "isInExploitKit": "false",
-        "hasPublishedExploit": "false",
-        "hasVerifiedExploit": "false",
+        # Exploit flags default to "false" (matches Defender's convention)
+        # and are OR-aggregated across CVEs — see EXPLOIT_FLAG_FIELDS.
+        **{col: "false" for col in EXPLOIT_FLAG_FIELDS},
     }
 
 
@@ -123,6 +135,13 @@ def group_rows(flat_rows: list[dict[str, str]]) -> list[list[Any]]:
             v = row.get(col, "")
             if v and v not in ("N/A", ""):
                 entry[col] = v
+
+        # Exploit flags: boolean-OR across CVEs. Case-insensitive compare
+        # against the literal "true"; anything else (including "false",
+        # empty, "N/A") contributes nothing. One true in the group wins.
+        for col in EXPLOIT_FLAG_FIELDS:
+            if row.get(col, "").strip().lower() == "true":
+                entry[col] = "true"
 
         # Remediation: prefer the shortest non-empty text — avoids huge
         # AI-generated blobs polluting the summary row.
