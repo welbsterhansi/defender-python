@@ -19,6 +19,7 @@ import logging
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
+from defender_pipeline.config import Config
 from defender_pipeline.utils.batching import BatchTooComplex
 from defender_pipeline.utils.retry import TransientARGError, arg_call_retry
 
@@ -39,10 +40,16 @@ class ResourceGraphClient:
         self,
         credential: TokenCredential,
         *,
+        config: Config | None = None,
         subscription_ids: list[str] | None = None,
     ) -> None:
         from azure.mgmt.resourcegraph import ResourceGraphClient as _SdkClient
-        self._client = _SdkClient(credential)
+        # The SDK's enlatado default is 2021-03-01, under which
+        # microsoft.security/cvedetails may omit exploitabilityDetails
+        # and silently zero out exploit flags — pin to the validated
+        # api-version from Config (2022-10-01).
+        config = config or Config()
+        self._client = _SdkClient(credential, api_version=config.arg_api_version)
         self._subscription_ids = subscription_ids
 
     @arg_call_retry
@@ -94,22 +101,52 @@ class ResourceGraphClient:
                 break
 
 
+_TOO_COMPLEX_CODE = "UnexpectedQueryExecutionError"
+
+
+def _has_too_complex_code(exc: Any) -> bool:
+    """Return True if the SDK exception carries the
+    ``UnexpectedQueryExecutionError`` code anywhere in the structured
+    error payload. Walks ``exc.error.code`` and
+    ``exc.error.details[*].code`` (each detail may be an ODataV4Format
+    object or a plain dict).
+
+    Falls back to a substring match on ``str(exc)`` so this still works
+    if the SDK wraps the error differently in a future release.
+    """
+    error = getattr(exc, "error", None)
+    if error is not None:
+        if getattr(error, "code", None) == _TOO_COMPLEX_CODE:
+            return True
+        details = getattr(error, "details", None) or []
+        for d in details:
+            code = getattr(d, "code", None)
+            if code is None and isinstance(d, dict):
+                code = d.get("code")
+            if code == _TOO_COMPLEX_CODE:
+                return True
+    # Last-resort fallback — guards against SDK re-wrapping or
+    # localization that strips the structured payload.
+    return _TOO_COMPLEX_CODE in str(exc)
+
+
 def _translate_arg_error(exc: Any) -> None:
     """Translate an ARG SDK exception into our internal exception types.
 
-    * ``UnexpectedQueryExecutionError`` (in the error details) →
-      :class:`BatchTooComplex` (caller splits the batch).
+    * ``UnexpectedQueryExecutionError`` (code in the structured error
+      details) → :class:`BatchTooComplex` (caller splits the batch).
     * ``5xx`` / ``429`` / connection errors → :class:`TransientARGError`
       (retry decorator will retry).
     * Other 4xx (400 bad KQL, 403 auth) → let the original exception
       propagate (terminal — caller can't recover).
     """
     status = getattr(exc, "status_code", None)
-    # ARG returns HTTP 400 with `code == "InternalServerError"` and a
-    # detail entry with `code == "UnexpectedQueryExecutionError"` when
-    # the query is too complex. Match on the substring.
     message = str(exc)
-    if "UnexpectedQueryExecutionError" in message:
+    # ARG returns HTTP 400 with top-level code "InternalServerError"
+    # and a nested detail entry whose code is "UnexpectedQueryExecutionError"
+    # when the query is too complex. Inspect the structured payload
+    # first, then fall back to substring.
+    if _has_too_complex_code(exc):
         raise BatchTooComplex(message) from exc
     if status in {429, 500, 502, 503, 504, 408}:
         raise TransientARGError(message) from exc

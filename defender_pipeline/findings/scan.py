@@ -92,7 +92,7 @@ def run_scan(
     credential = None  # lazy — only created if we need to build a client
     if arg_client is None:
         credential = get_credential()
-        arg_client = ResourceGraphClient(credential)
+        arg_client = ResourceGraphClient(credential, config=config)
     if tag_resolver is None and not opts.skip_tags:
         credential = credential or get_credential()
         tag_resolver = AcrTagResolver(credential, opts.acr_name)

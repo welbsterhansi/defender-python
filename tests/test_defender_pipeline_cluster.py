@@ -567,3 +567,98 @@ class TestCliCluster:
              patch("defender_pipeline.logging_setup.setup"):
             rc = cli.cmd_cluster(args)
         assert rc == cli.EXIT_ERROR
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ISSUE-001 — exploit flags must OR-aggregate across CVEs in a group
+# (see CLAUDE.md). Prior "last non-empty wins" was order-dependent for
+# boolean-string fields, producing false negatives on risk-prioritisation
+# columns in resultado_cruzamento.csv.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestExploitFlagAggregation:
+    @staticmethod
+    def _row(cve_id: str, *, kit: str, pub: str, ver: str) -> dict[str, str]:
+        return {
+            "NAMESPACE": "ns-app",
+            "PARENT_TYPE": "Deployment",
+            "PARENT_NAME": "webapp",
+            "repository": "contoso/webapp",
+            "digest": "sha256:" + "d" * 64,
+            "tag": "v1",
+            "cvssScore": "7.5",
+            "cveId": cve_id,
+            "severity": "High",
+            "packageCategory": "OS",
+            "packageLanguage": "",
+            "packageName": "openssl",
+            "currentVersion": "1.0",
+            "fixedVersion": "1.1",
+            "patchable": "true",
+            "remediation": "upgrade",
+            "fixStatus": "FixAvailable",
+            "cveAgeDays": "10",
+            "isInExploitKit": kit,
+            "hasPublishedExploit": pub,
+            "hasVerifiedExploit": ver,
+            "lastPushedToRegistryUTC": "2024-01-01",
+        }
+
+    @staticmethod
+    def _group_cols(rows: list[list[object]]) -> tuple[str, str, str]:
+        from defender_pipeline.openshift._group_findings import OUTPUT_HEADER
+        assert len(rows) == 1, f"expected single group, got {len(rows)}"
+        row = rows[0]
+        idx = {name: i for i, name in enumerate(OUTPUT_HEADER)}
+        return (
+            str(row[idx["IS_IN_EXPLOIT_KIT"]]),
+            str(row[idx["HAS_PUBLISHED_EXPLOIT"]]),
+            str(row[idx["HAS_VERIFIED_EXPLOIT"]]),
+        )
+
+    def test_true_then_false_keeps_true(self) -> None:
+        """Earlier CVE sets flag=true; a later CVE with false must NOT clobber it."""
+        from defender_pipeline.openshift._group_findings import group_rows
+        flat = [
+            self._row("CVE-2024-0001", kit="true",  pub="true",  ver="true"),
+            self._row("CVE-2024-0002", kit="false", pub="false", ver="false"),
+        ]
+        assert self._group_cols(group_rows(flat)) == ("true", "true", "true")
+
+    def test_false_then_true_promotes_to_true(self) -> None:
+        """Later CVE with true must flip the group even if earlier was false."""
+        from defender_pipeline.openshift._group_findings import group_rows
+        flat = [
+            self._row("CVE-2024-0001", kit="false", pub="false", ver="false"),
+            self._row("CVE-2024-0002", kit="true",  pub="true",  ver="true"),
+        ]
+        assert self._group_cols(group_rows(flat)) == ("true", "true", "true")
+
+    def test_all_false_stays_false(self) -> None:
+        """Regression guard: zero exploits in the group → all flags false."""
+        from defender_pipeline.openshift._group_findings import group_rows
+        flat = [
+            self._row("CVE-2024-0001", kit="false", pub="false", ver="false"),
+            self._row("CVE-2024-0002", kit="false", pub="false", ver="false"),
+        ]
+        assert self._group_cols(group_rows(flat)) == ("false", "false", "false")
+
+    def test_mixed_per_flag_independent(self) -> None:
+        """Each flag must OR independently — mixing columns across CVEs."""
+        from defender_pipeline.openshift._group_findings import group_rows
+        flat = [
+            self._row("CVE-2024-0001", kit="true",  pub="false", ver="false"),
+            self._row("CVE-2024-0002", kit="false", pub="true",  ver="false"),
+            self._row("CVE-2024-0003", kit="false", pub="false", ver="true"),
+        ]
+        assert self._group_cols(group_rows(flat)) == ("true", "true", "true")
+
+    def test_empty_string_treated_as_false(self) -> None:
+        """Defender may omit the field; empty must not count as a positive signal."""
+        from defender_pipeline.openshift._group_findings import group_rows
+        flat = [
+            self._row("CVE-2024-0001", kit="",      pub="",      ver=""),
+            self._row("CVE-2024-0002", kit="false", pub="false", ver="false"),
+        ]
+        assert self._group_cols(group_rows(flat)) == ("false", "false", "false")

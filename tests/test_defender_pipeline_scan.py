@@ -272,6 +272,50 @@ class TestEnrichMerge:
         assert findings[0].cvss_score == "8.1"
         assert findings[0].severity == "High"
 
+    def test_exploit_flags_or_between_enrichment_and_inline(self) -> None:
+        """Regression guard — see erros.md.
+
+        When ARG runs with the SDK's enlatado api-version (2021-03-01),
+        ``microsoft.security/cvedetails`` may omit
+        ``exploitabilityDetails``. The KQL enrichment then emits
+        ``false`` for all three exploit chips via ``iff(isnull, false,
+        ...)``. Before the fix, enrichment overrode inline so the real
+        positives from the assessment row disappeared from the CSV.
+        After the fix, we OR the two sources — any positive wins.
+        """
+        from defender_pipeline.findings.enrich import merge
+        assessment = _mk_assessment(
+            inline_severity="High", inline_cvss_base=8.1,
+            inline_in_exploit_kit="true",
+            inline_publicly_disclosed="true",
+            inline_verified="true",
+        )
+        # Enrichment present but exploit flags all zero (older-API shape).
+        enrichment = {"CVE-2024-1": _mk_enrichment(
+            cvss=9.8, severity="Critical",
+            verified=0, publicly_disclosed=0, in_exploit_kit=0,
+        )}
+        findings = merge([assessment], enrichment, {}, min_score=0, max_score=10)
+        assert len(findings) == 1
+        assert findings[0].is_in_exploit_kit == "true"
+        assert findings[0].has_published_exploit == "true"
+        assert findings[0].has_verified_exploit == "true"
+        # CVSS/severity still follow enrichment-wins policy.
+        assert findings[0].cvss_score == "9.8"
+        assert findings[0].severity == "Critical"
+
+    def test_exploit_flags_both_false_stay_false(self) -> None:
+        """If neither source reports an exploit, the chip is 'false'."""
+        from defender_pipeline.findings.enrich import merge
+        assessment = _mk_assessment()  # all inline exploit fields empty
+        enrichment = {"CVE-2024-1": _mk_enrichment(
+            verified=0, publicly_disclosed=0, in_exploit_kit=0,
+        )}
+        findings = merge([assessment], enrichment, {}, min_score=0, max_score=10)
+        assert findings[0].is_in_exploit_kit == "false"
+        assert findings[0].has_published_exploit == "false"
+        assert findings[0].has_verified_exploit == "false"
+
     def test_min_score_filter_drops_row(self) -> None:
         from defender_pipeline.findings.enrich import merge
         assessment = _mk_assessment(inline_severity="Low")  # cvss ~= 0.1
@@ -444,6 +488,162 @@ class TestScanOrchestrator:
         assert rows == 0
         lines = out.read_text().splitlines()
         assert len(lines) == 1  # header only
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ResourceGraphClient — SDK plumbing (api-version)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestResourceGraphClientApiVersion:
+    """Guards against the regression where ``Config.arg_api_version`` was
+    defined but never forwarded to the SDK — leaving the pipeline on the
+    SDK default (2021-03-01), under which ``microsoft.security/cvedetails``
+    omits ``exploitabilityDetails`` and exploit flags silently zero out."""
+
+    def test_default_config_pins_api_version_2022_10_01(self) -> None:
+        from defender_pipeline.azure.resource_graph import ResourceGraphClient
+
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            ResourceGraphClient(credential=MagicMock())
+
+        sdk_mock.assert_called_once()
+        _, kwargs = sdk_mock.call_args
+        assert kwargs.get("api_version") == "2022-10-01"
+
+    def test_explicit_config_is_forwarded(self) -> None:
+        from defender_pipeline.azure.resource_graph import ResourceGraphClient
+        from defender_pipeline.config import Config
+
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            ResourceGraphClient(
+                credential=MagicMock(), config=Config(),
+            )
+
+        _, kwargs = sdk_mock.call_args
+        assert kwargs.get("api_version") == "2022-10-01"
+
+    def test_custom_api_version_overrides_default(self) -> None:
+        """Operators can override via Config without editing the client."""
+        from defender_pipeline.azure.resource_graph import ResourceGraphClient
+        from defender_pipeline.config import Config
+
+        custom = Config(arg_api_version="2024-04-01")
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            ResourceGraphClient(credential=MagicMock(), config=custom)
+
+        _, kwargs = sdk_mock.call_args
+        assert kwargs.get("api_version") == "2024-04-01"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# _translate_arg_error — ARG exception hardening
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestTranslateArgError:
+    """Guard against regressions in the substring-free detection of
+    ``UnexpectedQueryExecutionError``. If the SDK wraps the message
+    differently (localization, versioning), ``_translate_arg_error``
+    must still catch the structured code path and raise BatchTooComplex
+    — otherwise too-complex batches stop splitting and runs fail."""
+
+    def _fake_exc(self, *, status_code=400, code=None, details=None, message=""):
+        """Build a minimal Azure-SDK-shaped exception. Plain classes
+        (not MagicMock) so ``__str__`` and attribute shape are honest."""
+        class _Error:
+            pass
+
+        class _Exc(Exception):
+            def __init__(self):
+                super().__init__(message)
+            def __str__(self):
+                return message
+
+        exc = _Exc()
+        exc.status_code = status_code
+        if code is not None or details is not None:
+            err = _Error()
+            err.code = code
+            err.details = details or []
+            exc.error = err
+        else:
+            exc.error = None
+        return exc
+
+    def _detail(self, code: str):
+        """ODataV4Format-shaped detail (has .code attribute)."""
+        class _D:
+            pass
+        d = _D()
+        d.code = code
+        return d
+
+    def test_detects_too_complex_in_top_level_code(self) -> None:
+        from defender_pipeline.azure.resource_graph import (
+            BatchTooComplex,
+            _translate_arg_error,
+        )
+        exc = self._fake_exc(code="UnexpectedQueryExecutionError")
+        with pytest.raises(BatchTooComplex):
+            _translate_arg_error(exc)
+
+    def test_detects_too_complex_in_nested_details(self) -> None:
+        """ARG actually returns code='InternalServerError' at the top
+        and the real code inside details — this is the common path."""
+        from defender_pipeline.azure.resource_graph import (
+            BatchTooComplex,
+            _translate_arg_error,
+        )
+        exc = self._fake_exc(
+            code="InternalServerError",
+            details=[self._detail("UnexpectedQueryExecutionError")],
+            message="opaque",
+        )
+        with pytest.raises(BatchTooComplex):
+            _translate_arg_error(exc)
+
+    def test_detects_too_complex_in_dict_shaped_details(self) -> None:
+        """Some SDK paths leave details as plain dicts, not ODataV4Format."""
+        from defender_pipeline.azure.resource_graph import (
+            BatchTooComplex,
+            _translate_arg_error,
+        )
+        exc = self._fake_exc(
+            code="InternalServerError",
+            details=[{"code": "UnexpectedQueryExecutionError"}],
+            message="opaque",
+        )
+        with pytest.raises(BatchTooComplex):
+            _translate_arg_error(exc)
+
+    def test_substring_fallback_for_rewrapped_errors(self) -> None:
+        """If the SDK ever drops the structured .error payload, we
+        still detect via substring on str(exc)."""
+        from defender_pipeline.azure.resource_graph import (
+            BatchTooComplex,
+            _translate_arg_error,
+        )
+        exc = self._fake_exc(
+            message="(InternalServerError) UnexpectedQueryExecutionError",
+        )
+        with pytest.raises(BatchTooComplex):
+            _translate_arg_error(exc)
+
+    def test_transient_mapping_still_works(self) -> None:
+        from defender_pipeline.azure.resource_graph import _translate_arg_error
+        from defender_pipeline.utils.retry import TransientARGError
+        exc = self._fake_exc(status_code=503, message="service unavailable")
+        with pytest.raises(TransientARGError):
+            _translate_arg_error(exc)
+
+    def test_terminal_errors_propagate(self) -> None:
+        """4xx that isn't too-complex and isn't 408/429 — let the SDK
+        exception bubble up unchanged. _translate_arg_error returns
+        normally; the caller then re-raises the original."""
+        from defender_pipeline.azure.resource_graph import _translate_arg_error
+        exc = self._fake_exc(status_code=403, message="forbidden")
+        _translate_arg_error(exc)  # does not raise — caller handles
 
 
 # ═══════════════════════════════════════════════════════════════════════════

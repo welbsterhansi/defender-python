@@ -142,10 +142,17 @@ def merge(
         published_dt = _parse_published_date(published_str)
         cve_age_days = (now - published_dt).days if published_dt else -1
 
-        # Exploit chips — enrichment > inline
-        in_kit = _bool_str(enr.in_exploit_kit if enr else row.inline_in_exploit_kit)
-        pub_exp = _bool_str(enr.publicly_disclosed if enr else row.inline_publicly_disclosed)
-        ver_exp = _bool_str(enr.verified if enr else row.inline_verified)
+        # Exploit chips — OR between enrichment and inline (policy: trust
+        # any positive signal). KQL enrichment collapses null
+        # exploitabilityDetails to false via iff(isnull,false,...) — on
+        # older ARG api-versions this silently masks real positives from
+        # the assessment inline, so we accept either source. See erros.md.
+        enr_in_kit = enr.in_exploit_kit if enr else None
+        enr_pub = enr.publicly_disclosed if enr else None
+        enr_ver = enr.verified if enr else None
+        in_kit = _bool_str(_to_bool(enr_in_kit) or _to_bool(row.inline_in_exploit_kit))
+        pub_exp = _bool_str(_to_bool(enr_pub) or _to_bool(row.inline_publicly_disclosed))
+        ver_exp = _bool_str(_to_bool(enr_ver) or _to_bool(row.inline_verified))
 
         # Patchable
         patchable = compute_patchable(row.fix_status, row.fixed_version)
