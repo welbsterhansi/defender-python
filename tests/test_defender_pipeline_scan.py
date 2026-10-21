@@ -870,6 +870,175 @@ class TestIterPagesCompletenessInvariant:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# ISSUE-002 P0.4 — iter_pages at realistic scale (>1000 rows across many
+# pages) with adversarial scenarios. ARG page cap is 1000, so a 12k-digest
+# scan traverses ~12 pages per batch. Tests here use synthetic fixtures
+# large enough that bugs that only manifest under multiple-page skip-token
+# chains have room to surface.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _synthetic_rows(n: int, prefix: str = "row") -> list[dict[str, int | str]]:
+    """Generate N unique synthetic rows. Each row has an ``i`` int index
+    and a ``k`` string key — the two together make a unique identity
+    pair that callers can compare set-of-keys between runs."""
+    return [{"i": idx, "k": f"{prefix}-{idx:06d}"} for idx in range(n)]
+
+
+def _paginate(
+    rows: list[dict], page_size: int, *, total_records: int | None = None,
+) -> list[MagicMock]:
+    """Split ``rows`` into SDK response mocks of ``page_size``. Each
+    response carries the FULL rows count as ``total_records`` by default
+    (what a real ARG query would do). Caller can override to simulate
+    divergent server-declared totals."""
+    total = total_records if total_records is not None else len(rows)
+    if not rows:
+        return [_make_sdk_response(data=[], skip_token=None, total_records=total)]
+    pages: list[MagicMock] = []
+    for i in range(0, len(rows), page_size):
+        chunk = rows[i:i + page_size]
+        is_last = (i + page_size) >= len(rows)
+        pages.append(_make_sdk_response(
+            data=chunk,
+            skip_token=None if is_last else f"tok_{i // page_size}",
+            total_records=total,
+        ))
+    return pages
+
+
+class TestIterPagesAtScale:
+    """Fixtures: ARG page cap is 1000, so these use >=1500 rows to force
+    at least 2 pages at page_size=1000 and multiple pages at smaller sizes."""
+
+    def test_scale_1500_rows_three_pages_happy_path(self) -> None:
+        rows = _synthetic_rows(1500)
+        pages = _paginate(rows, page_size=500)
+        assert len(pages) == 3, "fixture precondition: 3 pages"
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            sdk_mock.return_value.resources.side_effect = pages
+            from defender_pipeline.azure.resource_graph import ResourceGraphClient
+            client = ResourceGraphClient(credential=MagicMock())
+            collected = [r for p in client.iter_pages("print 1") for r in p]
+        assert len(collected) == 1500
+        # Order preserved from ARG; no dedup inside iter_pages.
+        assert collected[0]["i"] == 0 and collected[-1]["i"] == 1499
+        assert sdk_mock.return_value.resources.call_count == 3
+
+    def test_scale_total_records_overshoot_duplicate_detected(self) -> None:
+        """ARG duplicates a row across pages: collected (1500+1) !=
+        total_records (1500) → divergence → fail closed after retries."""
+        from defender_pipeline.azure.resource_graph import CompletenessError
+        rows = _synthetic_rows(1500)
+        pages = _paginate(rows, page_size=500)
+        # Inject a duplicate into page 2 — mimics ARG reordering causing
+        # the same row to appear across skip-token boundaries.
+        dup_row = rows[42]
+        pages[1].data = [*list(pages[1].data), dup_row]
+        pages[1].count = len(pages[1].data)
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            # All retries hit the same broken sequence.
+            sdk_mock.return_value.resources.side_effect = pages * 10
+            from defender_pipeline.azure.resource_graph import ResourceGraphClient
+            client = ResourceGraphClient(credential=MagicMock())
+            with pytest.raises(CompletenessError) as exc:
+                list(client.iter_pages("print 1", max_drain_retries=1))
+        # Error message must carry both numbers so operators can triage.
+        assert "1501" in str(exc.value)
+        assert "1500" in str(exc.value)
+
+    def test_scale_skip_token_dropped_prematurely_detected(self) -> None:
+        """ARG stops serving pages before the full result set is drained:
+        last page omits skip_token even though total_records says there's
+        more. Must raise."""
+        from defender_pipeline.azure.resource_graph import CompletenessError
+        rows = _synthetic_rows(1500)
+        pages = _paginate(rows, page_size=500)  # 3 real pages
+        # Simulate ARG stopping after page 2 by dropping skip_token on page 2.
+        pages[1].skip_token = None
+        # Only pages[0] and pages[1] will be fetched; pages[2] never.
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            # Each retry resets to the same broken behaviour.
+            sdk_mock.return_value.resources.side_effect = (
+                [pages[0], pages[1]] * 10
+            )
+            from defender_pipeline.azure.resource_graph import ResourceGraphClient
+            client = ResourceGraphClient(credential=MagicMock())
+            with pytest.raises(CompletenessError) as exc:
+                list(client.iter_pages("print 1", max_drain_retries=1))
+        # collected = 1000, total_records = 1500 → silent loss
+        assert "1000" in str(exc.value)
+        assert "1500" in str(exc.value)
+
+    def test_scale_divergence_then_success_at_1500_rows(self) -> None:
+        """First drain diverges (short), second drain completes.
+        iter_pages must retry transparently and yield only the clean run."""
+        rows = _synthetic_rows(1500)
+        bad_pages = _paginate(rows[:900], page_size=500,
+                              total_records=1500)  # claims 1500, gives 900
+        good_pages = _paginate(rows, page_size=500)
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            sdk_mock.return_value.resources.side_effect = (
+                bad_pages + good_pages
+            )
+            from defender_pipeline.azure.resource_graph import ResourceGraphClient
+            client = ResourceGraphClient(credential=MagicMock())
+            collected = [
+                r for p in client.iter_pages("print 1", max_drain_retries=2)
+                for r in p
+            ]
+        # Only the successful attempt's 1500 rows — not 900+1500.
+        assert len(collected) == 1500
+        indices = [r["i"] for r in collected]
+        assert indices[0] == 0 and indices[-1] == 1499
+
+    def test_scale_two_runs_same_scope_match_by_unique_key(self) -> None:
+        """Comparison-by-key between two runs of the same scope: the SET
+        of unique keys must be identical. Protects against the client's
+        observed failure mode (run A had 314 rows, run B had 149; the
+        incident surfaced only via diff, never via count)."""
+        rows = _synthetic_rows(2500)
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            sdk_mock.return_value.resources.side_effect = (
+                _paginate(rows, page_size=700)   # 4 pages for run A
+                + _paginate(rows, page_size=700)  # 4 pages for run B
+            )
+            from defender_pipeline.azure.resource_graph import ResourceGraphClient
+            client = ResourceGraphClient(credential=MagicMock())
+            run_a = [r for p in client.iter_pages("same query") for r in p]
+            run_b = [r for p in client.iter_pages("same query") for r in p]
+        keys_a = {row["k"] for row in run_a}
+        keys_b = {row["k"] for row in run_b}
+        assert len(run_a) == len(run_b) == 2500
+        assert keys_a == keys_b, (
+            f"two runs disagreed on {len(keys_a ^ keys_b)} unique keys "
+            f"(set-symmetric-difference) despite matching counts"
+        )
+
+    def test_scale_mutation_between_pages_declared_total_wins(self) -> None:
+        """Server declares total_records=1500 on page 1 but changes to
+        1550 on page 2 (data mutated mid-drain). iter_pages locks in the
+        first-page total — subsequent pages' total_records changes are
+        ignored for the invariant check. If actual collected matches the
+        LOCKED total, success. This documents the ARG snapshot limit:
+        iter_pages catches silent loss relative to the FIRST page's view."""
+        rows = _synthetic_rows(1500)
+        pages = _paginate(rows, page_size=500)  # 3 pages, each total=1500
+        # Simulate dataset growing: later pages report a higher total.
+        pages[1].total_records = 1550
+        pages[2].total_records = 1550
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            sdk_mock.return_value.resources.side_effect = pages
+            from defender_pipeline.azure.resource_graph import ResourceGraphClient
+            client = ResourceGraphClient(credential=MagicMock())
+            collected = [r for p in client.iter_pages("print 1") for r in p]
+        # We received 1500 rows, and expected locked = 1500 → pass.
+        # (The real limit here is documented: ARG does not promise
+        # snapshot consistency, see ISSUE-002.)
+        assert len(collected) == 1500
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Config.from_env — env-var overrides for ARG settings
 # ═══════════════════════════════════════════════════════════════════════════
 
