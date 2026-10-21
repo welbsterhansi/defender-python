@@ -89,6 +89,53 @@ class TestKqlBuilders:
         from defender_pipeline.azure.queries import build_scope_filter
         assert build_scope_filter() == ""
 
+    # ─── ISSUE-002 P0.1 — total-order `order by` after distinct ──────────
+    # Without a total ordering ARG skip-token pagination may duplicate or
+    # omit rows across pages (Microsoft docs). The order-by key must make
+    # rows unique.
+
+    def test_enumerate_query_has_total_order_by(self) -> None:
+        from defender_pipeline.azure.queries import build_enumerate_digests_query
+        kql = build_enumerate_digests_query("")
+        # Must appear AFTER distinct, otherwise ordering happens before
+        # dedup and doesn't help page stability.
+        distinct_idx = kql.index("distinct _repository, _digest")
+        order_idx = kql.index("| order by")
+        assert order_idx > distinct_idx, (
+            "`order by` must come after `distinct` so dedup happens first"
+        )
+        # Key = (_repository, _digest) is already the distinct tuple,
+        # so ordering on both gives a total order over emitted rows.
+        assert "_repository" in kql[order_idx:order_idx + 200]
+        assert "_digest" in kql[order_idx:order_idx + 200]
+
+    def test_batched_assessments_query_has_total_order_by(self) -> None:
+        from defender_pipeline.azure.queries import build_batched_assessments_query
+        kql = build_batched_assessments_query(["sha256:aaa"])
+        distinct_idx = kql.index("| distinct")
+        order_idx = kql.index("| order by")
+        assert order_idx > distinct_idx, (
+            "`order by` must come after `distinct`"
+        )
+        # Identity tuple for an assessment row = (repository, digest, cveId,
+        # packageName). Ordering by these makes the per-page cursor stable
+        # even if the service reorders rows that differ only on attributes.
+        tail = kql[order_idx:]
+        for key in ("repository", "digest", "cveId", "packageName"):
+            assert key in tail, f"order by must include {key}"
+
+    def test_batched_cvedetails_query_has_total_order_by(self) -> None:
+        from defender_pipeline.azure.queries import build_batched_cvedetails_query
+        kql = build_batched_cvedetails_query(["CVE-2024-1"])
+        # cvedetails ends with `project` after `summarize by cveIdJoin`,
+        # so cveIdJoin is already unique per emitted row.
+        summarize_idx = kql.index("summarize")
+        order_idx = kql.index("| order by")
+        assert order_idx > summarize_idx, (
+            "`order by` must come after `summarize ... by cveIdJoin`"
+        )
+        assert "cveIdJoin" in kql[order_idx:order_idx + 200]
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Batching (split-on-failure)

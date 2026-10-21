@@ -54,7 +54,8 @@ def build_enumerate_digests_query(filter_kql: str = "") -> str:
     _repository = tostring(_image.RepositoryDetails.RepositoryName),
     _digest     = tostring(_image.Digest)
 | where isnotempty(_digest)
-| distinct _repository, _digest"""
+| distinct _repository, _digest
+| order by _repository asc, _digest asc"""
 
 
 def build_batched_assessments_query(digests: Sequence[str]) -> str:
@@ -141,7 +142,8 @@ def build_batched_assessments_query(digests: Sequence[str]) -> str:
     repository, digest, cveId, packageName, currentVersion, fixedVersion,
     fixStatus, packageCategory, packageLanguage, remediation, lastPushedToRegistryUTC,
     inlineSeverity, inlineCvssBase, inlinePublishedDate,
-    inlineInExploitKit, inlinePubliclyDisclosed, inlineVerified"""
+    inlineInExploitKit, inlinePubliclyDisclosed, inlineVerified
+| order by repository asc, digest asc, cveId asc, packageName asc"""
 
 
 def build_batched_cvedetails_query(cve_ids: Sequence[str]) -> str:
@@ -175,7 +177,8 @@ def build_batched_cvedetails_query(cve_ids: Sequence[str]) -> str:
     inExploitKitEnrich = max(toint(inExploitKitEnrich))
   by cveIdJoin
 | project cveIdJoin, cvssEnrich, publishedDateEnrich, severityEnrich,
-          verifiedExpEnrich, publishedExpEnrich, inExploitKitEnrich"""
+          verifiedExpEnrich, publishedExpEnrich, inExploitKitEnrich
+| order by cveIdJoin asc"""
 
 
 # ---------------------------------------------------------------------------
