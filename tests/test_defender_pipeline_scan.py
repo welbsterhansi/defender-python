@@ -708,6 +708,168 @@ class TestRunQueryCompletenessSignals:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# ISSUE-002 P0.3 — iter_pages must validate completeness end-to-end.
+# All-or-nothing: on silent loss (collected != total_records OR
+# result_truncated=true without skip_token) retry the full drain; on
+# persistent divergence raise CompletenessError — never yield partial.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _make_sdk_response(
+    *, data: list, skip_token: str | None,
+    total_records: int, result_truncated: str = "false",
+) -> MagicMock:
+    """Build a mock ARG response with all completeness fields set."""
+    return MagicMock(
+        data=data, skip_token=skip_token,
+        total_records=total_records, count=len(data),
+        result_truncated=result_truncated,
+    )
+
+
+class TestIterPagesCompletenessInvariant:
+    @staticmethod
+    def _client_with_pages(sdk_mock: MagicMock, pages: list[MagicMock]):
+        """Configure the SDK mock to return the given page sequence on
+        successive resources() calls. Infinite tail returns an empty
+        no-skip page to catch over-draining bugs."""
+        from defender_pipeline.azure.resource_graph import ResourceGraphClient
+        empty_tail = _make_sdk_response(
+            data=[], skip_token=None, total_records=0,
+        )
+        sdk_mock.return_value.resources.side_effect = pages + [empty_tail] * 100
+        return ResourceGraphClient(credential=MagicMock())
+
+    def test_happy_path_multipage_total_records_matches(self) -> None:
+        """total_records=5 across 3 pages → drain succeeds, no retry."""
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            pages = [
+                _make_sdk_response(data=[{"i": 1}, {"i": 2}],
+                                   skip_token="t1", total_records=5),
+                _make_sdk_response(data=[{"i": 3}, {"i": 4}],
+                                   skip_token="t2", total_records=5),
+                _make_sdk_response(data=[{"i": 5}],
+                                   skip_token=None, total_records=5),
+            ]
+            client = self._client_with_pages(sdk_mock, pages)
+            collected = list(client.iter_pages("print 1"))
+        rows = [row for page in collected for row in page]
+        assert len(rows) == 5
+        # Exactly 3 SDK calls — no retry needed.
+        assert sdk_mock.return_value.resources.call_count == 3
+
+    def test_total_records_mismatch_raises_completeness_error(self) -> None:
+        """collected < total_records → silent loss. Must raise after retries."""
+        from defender_pipeline.azure.resource_graph import CompletenessError
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            # Server says 10, we only receive 3.
+            drop_page = _make_sdk_response(
+                data=[{"i": 1}, {"i": 2}, {"i": 3}],
+                skip_token=None, total_records=10,
+            )
+            # All retry attempts hit the same broken response.
+            sdk_mock.return_value.resources.side_effect = [drop_page] * 10
+            from defender_pipeline.azure.resource_graph import ResourceGraphClient
+            client = ResourceGraphClient(credential=MagicMock())
+            with pytest.raises(CompletenessError) as exc:
+                list(client.iter_pages("print 1", max_drain_retries=2))
+        assert "3" in str(exc.value)
+        assert "10" in str(exc.value)
+
+    def test_truncated_without_skip_token_raises(self) -> None:
+        """result_truncated=true with no skip_token = ARG stopped mid-stream.
+        Must raise — this is silent loss."""
+        from defender_pipeline.azure.resource_graph import CompletenessError
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            trunc_page = _make_sdk_response(
+                data=[{"i": 1}], skip_token=None,
+                total_records=1, result_truncated="true",
+            )
+            sdk_mock.return_value.resources.side_effect = [trunc_page] * 10
+            from defender_pipeline.azure.resource_graph import ResourceGraphClient
+            client = ResourceGraphClient(credential=MagicMock())
+            with pytest.raises(CompletenessError) as exc:
+                list(client.iter_pages("print 1", max_drain_retries=2))
+        assert "truncated" in str(exc.value).lower()
+
+    def test_truncated_true_with_skip_token_is_fine(self) -> None:
+        """result_truncated=true WITH skip_token is normal (there is more).
+        Only the final page's truncated flag matters."""
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            pages = [
+                _make_sdk_response(data=[{"i": 1}], skip_token="t1",
+                                   total_records=2, result_truncated="true"),
+                _make_sdk_response(data=[{"i": 2}], skip_token=None,
+                                   total_records=2, result_truncated="false"),
+            ]
+            client = self._client_with_pages(sdk_mock, pages)
+            rows = [r for p in client.iter_pages("print 1") for r in p]
+        assert len(rows) == 2
+
+    def test_sdk_without_total_records_skips_count_validation(self) -> None:
+        """Legacy SDK responses may not send total_records. Wrapper
+        must not raise just because the signal is missing — only
+        validate what we have."""
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            # Response WITHOUT total_records (spec limits attributes).
+            legacy_page = MagicMock(spec=["data", "skip_token"])
+            legacy_page.data = [{"i": 1}, {"i": 2}]
+            legacy_page.skip_token = None
+            sdk_mock.return_value.resources.side_effect = [legacy_page]
+            from defender_pipeline.azure.resource_graph import ResourceGraphClient
+            client = ResourceGraphClient(credential=MagicMock())
+            rows = [r for p in client.iter_pages("print 1") for r in p]
+        assert len(rows) == 2  # no CompletenessError raised
+
+    def test_divergence_then_success_does_not_raise(self) -> None:
+        """First drain diverges (collected != total_records); second drain
+        succeeds. iter_pages must transparently retry and yield only
+        the successful attempt's data."""
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            # Attempt 1: one page, collected=1, total_records=2 → divergent
+            bad_page = _make_sdk_response(
+                data=[{"i": 1}], skip_token=None, total_records=2,
+            )
+            # Attempt 2: two pages, collected=2, total_records=2 → ok
+            good_1 = _make_sdk_response(
+                data=[{"i": 1}], skip_token="t1", total_records=2,
+            )
+            good_2 = _make_sdk_response(
+                data=[{"i": 2}], skip_token=None, total_records=2,
+            )
+            sdk_mock.return_value.resources.side_effect = [bad_page, good_1, good_2]
+            from defender_pipeline.azure.resource_graph import ResourceGraphClient
+            client = ResourceGraphClient(credential=MagicMock())
+            rows = [r for p in client.iter_pages(
+                "print 1", max_drain_retries=2,
+            ) for r in p]
+        # Yielded only the good attempt (2 rows, not 1+2=3).
+        assert len(rows) == 2
+        assert rows == [{"i": 1}, {"i": 2}]
+
+    def test_no_partial_yield_on_failure(self) -> None:
+        """Critical safety: if all retries fail, iter_pages must NOT
+        have yielded any data to the caller. Fail-closed guarantee."""
+        from defender_pipeline.azure.resource_graph import CompletenessError
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            bad = _make_sdk_response(
+                data=[{"i": 1}], skip_token=None, total_records=99,
+            )
+            sdk_mock.return_value.resources.side_effect = [bad] * 10
+            from defender_pipeline.azure.resource_graph import ResourceGraphClient
+            client = ResourceGraphClient(credential=MagicMock())
+
+            yielded: list = []
+            with pytest.raises(CompletenessError):
+                for page in client.iter_pages("print 1", max_drain_retries=1):
+                    yielded.extend(page)
+        assert yielded == [], (
+            "fail-closed violated: iter_pages yielded data despite "
+            "persistent completeness divergence"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Config.from_env — env-var overrides for ARG settings
 # ═══════════════════════════════════════════════════════════════════════════
 

@@ -91,8 +91,11 @@ class ResourceGraphClient:
             # Completeness signals from the ARG QueryResponse — see
             # ISSUE-002 (docs/ISSUES.md). iter_pages uses these to
             # validate that the drain actually matches the server's
-            # declared row count.
-            "total_records": getattr(response, "total_records", None),
+            # declared row count. Each is defensively coerced: a
+            # malformed / missing field must not raise here.
+            "total_records": _coerce_total_records(
+                getattr(response, "total_records", None),
+            ),
             "count": _coerce_count(getattr(response, "count", None), data),
             "result_truncated": _normalise_truncated(
                 getattr(response, "result_truncated", None),
@@ -105,17 +108,104 @@ class ResourceGraphClient:
 
     def iter_pages(
         self, query: str, *, top: int | None = None,
+        max_drain_retries: int = 2,
     ) -> Iterator[list[dict[str, Any]]]:
-        """Drain all skip-token pages for a single query. Yields
-        ``data`` list per page. ``top`` defaults to the client's
-        configured ``arg_page_size``."""
+        """Drain all skip-token pages for a single query, validating
+        completeness end-to-end. ``top`` defaults to the client's
+        configured ``arg_page_size``.
+
+        Completeness invariant (ISSUE-002, docs/ISSUES.md):
+
+          * Collected row count must equal ``total_records`` from the
+            first page (when the SDK provides it).
+          * The final page must not have ``result_truncated=true``
+            without a ``skip_token`` — that signals ARG stopped
+            mid-stream and there is undetected loss.
+
+        On divergence the whole drain is retried up to
+        ``max_drain_retries`` times (default 2 → 3 total attempts).
+        If divergence persists, :class:`CompletenessError` is raised
+        and **no data is yielded** — the caller receives nothing,
+        guaranteeing fail-closed behaviour (never emit a report that
+        looks complete when it isn't).
+        """
+        last_error: CompletenessError | None = None
+        for attempt in range(max_drain_retries + 1):
+            try:
+                pages = self._drain_once(query, top=top)
+            except CompletenessError as exc:
+                last_error = exc
+                if attempt < max_drain_retries:
+                    log.warning(
+                        "iter_pages drain divergent on attempt %d/%d: %s",
+                        attempt + 1, max_drain_retries + 1, exc,
+                    )
+                continue
+            # Validated — safe to yield now.
+            yield from pages
+            return
+        assert last_error is not None
+        raise last_error
+
+    def _drain_once(
+        self, query: str, *, top: int | None,
+    ) -> list[list[dict[str, Any]]]:
+        """Drain pages into a buffered list, validating completeness
+        AFTER all pages are received. Returns the page list on success;
+        raises :class:`CompletenessError` on divergence. Never yields
+        partial data to the caller — that's the outer ``iter_pages``
+        contract."""
         skip: str | None = None
+        pages: list[list[dict[str, Any]]] = []
+        collected = 0
+        expected: int | None = None
+        final_truncated = False
+        page_number = 0
+
         while True:
             page = self.run_query(query, skip_token=skip, top=top)
-            yield page.get("data", [])
+            page_number += 1
+            data = page.get("data", [])
+            pages.append(data)
+            collected += len(data)
+            if expected is None:
+                # Lock in the server-declared total from the first page.
+                expected = page.get("total_records")
+            final_truncated = page.get("result_truncated", False)
             skip = page.get("skip_token")
             if not skip:
                 break
+
+        if final_truncated:
+            raise CompletenessError(
+                f"ARG returned result_truncated=true with no skip_token "
+                f"after {page_number} page(s); collected={collected}, "
+                f"total_records={expected} — silent loss",
+            )
+        if expected is not None and collected != expected:
+            raise CompletenessError(
+                f"collected {collected} rows but total_records={expected} "
+                f"across {page_number} page(s) — silent loss",
+            )
+        return pages
+
+
+class CompletenessError(Exception):
+    """Raised by :meth:`ResourceGraphClient.iter_pages` when the drain
+    cannot be reconciled against the ARG server-declared totals (see
+    ISSUE-002 in ``docs/ISSUES.md``). The caller receives no data
+    when this is raised — fail-closed by design."""
+
+
+def _coerce_total_records(raw: Any) -> int | None:
+    """Normalise total_records to int or None. Guards against SDK
+    responses that omit the field (older versions) and against bool
+    (which is a subclass of int and would be a nonsense value here)."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    return None
 
 
 def _coerce_count(raw: Any, data: list[Any]) -> int:
