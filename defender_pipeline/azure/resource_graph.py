@@ -86,7 +86,18 @@ class ResourceGraphClient:
         # response.data can be a list of dicts (default) or a table object
         # depending on the SDK version. Normalize to list-of-dicts.
         data = response.data if isinstance(response.data, list) else []
-        result: dict[str, Any] = {"data": data}
+        result: dict[str, Any] = {
+            "data": data,
+            # Completeness signals from the ARG QueryResponse — see
+            # ISSUE-002 (docs/ISSUES.md). iter_pages uses these to
+            # validate that the drain actually matches the server's
+            # declared row count.
+            "total_records": getattr(response, "total_records", None),
+            "count": _coerce_count(getattr(response, "count", None), data),
+            "result_truncated": _normalise_truncated(
+                getattr(response, "result_truncated", None),
+            ),
+        }
         skip = getattr(response, "skip_token", None)
         if skip:
             result["skip_token"] = skip
@@ -105,6 +116,29 @@ class ResourceGraphClient:
             skip = page.get("skip_token")
             if not skip:
                 break
+
+
+def _coerce_count(raw: Any, data: list[Any]) -> int:
+    """Return the server-reported row count for this page, or fall back
+    to the length of the normalised data list when the SDK didn't send
+    one. Guards against older SDKs or malformed responses — a missing
+    count must not break the completeness invariant."""
+    if isinstance(raw, int):
+        return raw
+    return len(data)
+
+
+def _normalise_truncated(raw: Any) -> bool:
+    """Normalise the ARG ``result_truncated`` field (str 'true'/'false'
+    or ``ResultTruncated`` enum) to a plain bool. Missing / unknown →
+    False (treat as 'not truncated' so a missing field doesn't trigger
+    false-positive truncation alarms)."""
+    if raw is None:
+        return False
+    value = getattr(raw, "value", raw)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() == "true"
 
 
 _TOO_COMPLEX_CODE = "UnexpectedQueryExecutionError"

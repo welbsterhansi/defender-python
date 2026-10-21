@@ -618,6 +618,96 @@ class TestResourceGraphClientApiVersion:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# ISSUE-002 P0.2 — run_query must expose SDK completeness signals so
+# iter_pages (P0.3) can validate that the drain actually completed.
+# The ARG QueryResponse carries total_records, count, result_truncated
+# alongside data/skip_token; the wrapper was dropping them.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestRunQueryCompletenessSignals:
+    @staticmethod
+    def _build_client(sdk_mock: MagicMock, *, response: MagicMock):
+        from defender_pipeline.azure.resource_graph import ResourceGraphClient
+        sdk_mock.return_value.resources.return_value = response
+        return ResourceGraphClient(credential=MagicMock())
+
+    def test_run_query_preserves_total_records(self) -> None:
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            response = MagicMock(
+                data=[{"x": 1}], skip_token=None,
+                total_records=12345, count=1, result_truncated="false",
+            )
+            client = self._build_client(sdk_mock, response=response)
+            result = client.run_query("print 1")
+        assert result["total_records"] == 12345
+
+    def test_run_query_preserves_count(self) -> None:
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            response = MagicMock(
+                data=[{"x": 1}, {"x": 2}], skip_token=None,
+                total_records=2, count=2, result_truncated="false",
+            )
+            client = self._build_client(sdk_mock, response=response)
+            result = client.run_query("print 1")
+        # count == rows returned in THIS response (not total).
+        assert result["count"] == 2
+
+    def test_run_query_normalises_result_truncated_true(self) -> None:
+        """SDK may return str 'true'/'false' or ResultTruncated enum.
+        Wrapper normalises to bool so callers don't need to care."""
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            response = MagicMock(
+                data=[], skip_token=None,
+                total_records=0, count=0, result_truncated="true",
+            )
+            client = self._build_client(sdk_mock, response=response)
+            result = client.run_query("print 1")
+        assert result["result_truncated"] is True
+
+    def test_run_query_normalises_result_truncated_false(self) -> None:
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            response = MagicMock(
+                data=[], skip_token=None,
+                total_records=0, count=0, result_truncated="false",
+            )
+            client = self._build_client(sdk_mock, response=response)
+            result = client.run_query("print 1")
+        assert result["result_truncated"] is False
+
+    def test_run_query_backward_compat_data_and_skip_token(self) -> None:
+        """Must NOT regress the existing contract: callers that only
+        look at data/skip_token keep working."""
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            response = MagicMock(
+                data=[{"a": 1}], skip_token="TOK",
+                total_records=1, count=1, result_truncated="false",
+            )
+            client = self._build_client(sdk_mock, response=response)
+            result = client.run_query("print 1")
+        assert result["data"] == [{"a": 1}]
+        assert result["skip_token"] == "TOK"
+
+    def test_run_query_handles_missing_sdk_fields_defensively(self) -> None:
+        """Older SDK responses may lack one of the completeness fields.
+        Wrapper must not crash — it should default sensibly:
+          total_records → None (unknown)
+          count         → len(data) (we can derive it)
+          result_truncated → False (treat as 'unknown' == not truncated)
+        """
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            # Build a response WITHOUT the new fields.
+            response = MagicMock(spec=["data", "skip_token"])
+            response.data = [{"a": 1}, {"b": 2}]
+            response.skip_token = None
+            client = self._build_client(sdk_mock, response=response)
+            result = client.run_query("print 1")
+        assert result["total_records"] is None
+        assert result["count"] == 2
+        assert result["result_truncated"] is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Config.from_env — env-var overrides for ARG settings
 # ═══════════════════════════════════════════════════════════════════════════
 
