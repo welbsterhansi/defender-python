@@ -74,3 +74,168 @@ fixtures `ns-app`, `contoso/webapp`): true-then-false, false-then-true,
 all-false regression guard, mixed-per-flag independence, and empty-string
 treated as false. `pytest` + `ruff` + `pyright` pass clean on the touched
 files.
+
+---
+
+## ISSUE-002 — Azure Resource Graph pagination not resilient at scale
+
+- **Status:** planned (tasks #5–#12). Headline fix (`order by`) also being
+  worked on an upstream branch; this issue tracks the full remediation.
+- **Reported:** 2026-10-21 — client incident: `acr.csv` run with ~12k
+  digests returned incomplete rows; a per-image rescan (`fad/financebatch:1.0.9v2`)
+  produced 149 lines vs ~1 line previously. Loss was silent.
+- **Severity:** HIGH — risk-prioritisation data (exploit flags, CVE lists)
+  silently incomplete; impact scales with digest volume and scan duration.
+
+### Root cause
+
+Two independent gaps combined to produce silent data loss:
+
+1. **ARG queries have no `order by`.** `defender_pipeline/azure/queries.py`
+   (`build_enumerate_digests_query`, `build_batched_assessments_query`,
+   `build_batched_cvedetails_query`) finish with `distinct` / `summarize`
+   but never emit a total order. Microsoft documents that skip-token
+   pagination without a total ordering may **duplicate or omit records**
+   across pages ([Resource Graph — Query pagination][arg-page]). Probability
+   grows with page count — the client's 12k-digest scan traversed many
+   pages.
+
+2. **Completeness signals from the SDK are discarded.** The ARG
+   `QueryResponse` carries `total_records`, `count` (rows in *this* page)
+   and `result_truncated` alongside `data`/`skip_token`. The current
+   wrapper (`defender_pipeline/azure/resource_graph.py:88-93`) returns
+   only `data` + `skip_token`. `iter_pages` drains until `skip_token` is
+   empty and never checks whether the collected row count matches
+   `total_records` — so a page that was skipped (cause 1) or truncated
+   is lost without any alarm. The client only noticed by comparing two
+   runs.
+
+[arg-page]: https://learn.microsoft.com/azure/governance/resource-graph/concepts/work-with-data#paging-results
+
+### Why just `order by` is not enough
+
+Adding `order by` fixes the ordering determinism (cause 1) and resolves
+the observed incident. It does **not** address:
+
+- **Snapshot consistency across pages.** ARG does not guarantee that
+  pages come from a single point in time. A 2.4h scan can see
+  assessments change between pages. This is an ARG service limit, not
+  a code bug — but a completeness invariant lets us detect its effect.
+- **Silent loss from any future cause.** Any new source of per-page
+  skip (SDK bug, transient 5xx not retried, custom top value hitting an
+  edge case) stays undetected without completeness validation.
+- **Multi-hour scan loss on terminal failure.** A `BatchExhausted` or
+  completeness failure late in a scan currently discards everything
+  collected so far — the operator rediscovers the problem after hours
+  of wall time.
+
+### Remediation plan (aligned with team direction)
+
+**P0 — incident fix + close-the-loop detection** (critical; the two
+together are the acceptance criterion):
+
+- **P0.1 (task #6)** — add `order by` after `distinct`/`summarize` on all
+  three queries. The ordering key must make rows unique (total order);
+  since each query ends with `distinct` over all projected columns, any
+  stable ordering over those columns is total.
+- **P0.2 (task #7)** — preserve `total_records`, `count`,
+  `result_truncated` in the dict returned by `run_query`.
+- **P0.3 (task #8)** — in `iter_pages`: accumulate `count` across pages,
+  compare against `total_records` from the first response, detect
+  `result_truncated=true` without a `skip_token`. On divergence, re-run
+  the *entire* batch drain (bounded retries, default 3). If divergence
+  persists, raise a terminal `CompletenessError` — **do not emit a CSV**.
+  Fail closed.
+- **P0.4 (task #9)** — synthetic multipage tests (>1000 rows) covering:
+  happy path with `total_records` matching; duplicate rows across
+  skip-tokens; missing `skip_token` with `result_truncated=true`;
+  `total_records` divergent from received rows; mutation between
+  pages; two runs of the same scan compared by unique key (not count).
+
+**P1 — reduce operational impact** (not required for the fix, but
+required to be production-safe at scale):
+
+- **P1.1 (task #10)** — atomic per-batch checkpoint
+  (`.checkpoint.json` written via write-rename). `--resume` re-reads
+  the checkpoint and skips completed batches. CSV is written **only**
+  when the full scan succeeds — never partial.
+- **P1.2 (task #11)** — per-batch structured log line:
+  `batch_id`, `items_in`, `rows_expected` (from `total_records`),
+  `rows_received`, `duplicates_dropped`, `pages_consumed`, `attempts`,
+  `result_truncated_flag`, `elapsed_ms`. Format designed to grep/parse
+  during client triage.
+
+### Acceptance criterion (from team direction)
+
+A fix is accepted iff **all** of:
+
+1. **Total order** — `order by` on all paginated queries over keys that
+   make rows unique.
+2. **Completeness invariant** — `rows_received == total_records` at end
+   of drain; no `result_truncated=true` with empty `skip_token`.
+3. **Integral batch retry** — on divergence, repeat the whole batch
+   (not just the failing page), bounded.
+4. **Fail closed** — persistent divergence raises terminal; no CSV
+   emitted; non-zero exit code.
+5. **Multipage test in scale** — synthetic fixtures >1000 rows covering
+   adversarial scenarios (dup/missing-token/truncated/mutant);
+   comparison-by-key between two runs of the same scope.
+
+### Why these alternatives were rejected
+
+- **Pre-count via `summarize count()`** — adds a separate query, opens a
+  drift window between count and read. `total_records` from the actual
+  response is strictly better (same transaction, zero extra query).
+- **`--allow-partial`** — would emit an incomplete CSV with a warning.
+  "Fail open" is worse than the current behavior for a security tool
+  (risk-prioritisation data must be complete or absent). Replaced by
+  P1.1 (checkpoint + resume), which preserves work without publishing
+  partial reports.
+
+### Open — needs separate investigation (NOT part of this issue)
+
+- **K8s list pagination (`list_namespace` / `list_namespaced_pod`).**
+  Earlier analysis flagged this as HIGH severity on the assumption that
+  the apiserver silently chunks at 500 items. The code currently does
+  not pass `_continue=` / `limit=`, but actual truncation behavior
+  depends on apiserver flags
+  (`--default-watch-cache-size`, chunk-size) and client defaults. No
+  loss has been observed in the field. Separate investigation ticket
+  before deciding.
+- **Snapshot filter via `properties.timeGenerated`.** Would create a
+  virtual snapshot for long-running scans. Depends on whether Defender
+  exposes a usable timestamp on `securityresources` assessments. Spike
+  before implementing.
+
+### Related non-fixes to review
+
+- **ACR tag resolution** (`defender_pipeline/azure/acr.py:52-71`) has
+  no retry — a transient 429/503 silently converts all digests in that
+  repo to `TAG=N/A`. Does **not** explain the observed CVE loss (that
+  is pagination), but is an orthogonal reliability gap. Track
+  separately once ISSUE-002 lands.
+- **Request timeout** (`defender_pipeline/config.py:25` =
+  `request_timeout_s=60`) is defined but not forwarded to the SDK
+  `self._client.resources(request)` call. Same — orthogonal, track
+  separately.
+
+### Suite baseline — env-missing failures vs regression (as of P0.4)
+
+`pytest` on this branch reports **28 failures / 116 passes**. All 28
+failures are pre-existing *environment* gaps, not regressions. Audited
+by failing-import root cause:
+
+| Count | Group | Root cause | Resolution |
+|---|---|---|---|
+| 16 | A | `from datetime import UTC` (Python 3.11+ only). Local dev runs Python 3.10, which does not export `datetime.UTC`. Affected: `TestEnrichMerge` (11), `TestScanOrchestrator` (2), `TestCliScan` (2), `TestCLI::test_expand_subcommand_runs_end_to_end` (1) — all transitively import `defender_pipeline/findings/enrich.py:18`. | CI runs Python ≥3.11 per `pyproject.toml`. Expected green on CI. |
+| 12 | B | `No module named 'kubernetes'`. Local dev env is missing the OCP client SDK. Affected: `TestCliCluster` (2), `TestNamespaceClassification` (6), `TestOutputOrdering` (2), `TestRunClusterEndToEnd` (2). | CI installs `kubernetes` from `pyproject.toml` extras. Expected green on CI. |
+
+**Zero regressions introduced by P0.1–P0.4.** Verified by
+`git stash && pytest` baseline before every commit (same 28 failures
+pre and post). The pagination-resilience changes do not import either
+`datetime.UTC` nor `kubernetes`.
+
+Local reproduction: install extras (`pip install -e .[pipeline]` plus
+the kubernetes client) and run Python ≥ 3.11 — all 28 are expected to
+pass. CI is the authoritative environment.
+
