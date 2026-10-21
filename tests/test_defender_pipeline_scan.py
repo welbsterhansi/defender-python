@@ -582,6 +582,76 @@ class TestResourceGraphClientApiVersion:
         _, kwargs = sdk_mock.call_args
         assert kwargs.get("api_version") == "2024-04-01"
 
+    def test_page_size_defaults_to_1000(self) -> None:
+        """arg_page_size default is forwarded to run_query as ``top``."""
+        from defender_pipeline.azure.resource_graph import ResourceGraphClient
+
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            client = ResourceGraphClient(credential=MagicMock())
+            # Simulate a single page then no skip_token.
+            sdk_mock.return_value.resources.return_value = MagicMock(
+                data=[], skip_token=None,
+            )
+            list(client.iter_pages("print 1"))
+
+        # resources() receives a QueryRequest with options.top = 1000.
+        _, kwargs = sdk_mock.return_value.resources.call_args
+        request = kwargs.get("request") or sdk_mock.return_value.resources.call_args[0][0]
+        assert request.options.top == 1000
+
+    def test_page_size_from_custom_config(self) -> None:
+        from defender_pipeline.azure.resource_graph import ResourceGraphClient
+        from defender_pipeline.config import Config
+
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            client = ResourceGraphClient(
+                credential=MagicMock(),
+                config=Config(arg_page_size=250),
+            )
+            sdk_mock.return_value.resources.return_value = MagicMock(
+                data=[], skip_token=None,
+            )
+            list(client.iter_pages("print 1"))
+
+        request = sdk_mock.return_value.resources.call_args[0][0]
+        assert request.options.top == 250
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Config.from_env — env-var overrides for ARG settings
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestConfigFromEnv:
+    """Guard the env-var contract — operators ship values via env, not
+    code edits. The arg_api_version override specifically prevents the
+    reintroduction of the 2021-03-01 bug by letting ops pin a newer
+    api-version without a release."""
+
+    def test_arg_api_version_env_override(self, monkeypatch) -> None:
+        from defender_pipeline.config import from_env
+        monkeypatch.setenv("DEFENDER_PIPELINE_ARG_API_VERSION", "2024-04-01")
+        cfg = from_env()
+        assert cfg.arg_api_version == "2024-04-01"
+
+    def test_arg_api_version_default_is_2022_10_01(self, monkeypatch) -> None:
+        from defender_pipeline.config import from_env
+        monkeypatch.delenv("DEFENDER_PIPELINE_ARG_API_VERSION", raising=False)
+        cfg = from_env()
+        assert cfg.arg_api_version == "2022-10-01"
+
+    def test_arg_page_size_env_override(self, monkeypatch) -> None:
+        from defender_pipeline.config import from_env
+        monkeypatch.setenv("DEFENDER_PIPELINE_ARG_PAGE_SIZE", "250")
+        cfg = from_env()
+        assert cfg.arg_page_size == 250
+
+    def test_arg_page_size_default_is_1000(self, monkeypatch) -> None:
+        from defender_pipeline.config import from_env
+        monkeypatch.delenv("DEFENDER_PIPELINE_ARG_PAGE_SIZE", raising=False)
+        cfg = from_env()
+        assert cfg.arg_page_size == 1000
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # _translate_arg_error — ARG exception hardening

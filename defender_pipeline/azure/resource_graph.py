@@ -51,6 +51,7 @@ class ResourceGraphClient:
         config = config or Config()
         self._client = _SdkClient(credential, api_version=config.arg_api_version)
         self._subscription_ids = subscription_ids
+        self._page_size = config.arg_page_size
 
     @arg_call_retry
     def run_query(
@@ -58,16 +59,18 @@ class ResourceGraphClient:
         query: str,
         *,
         skip_token: str | None = None,
-        top: int = 1000,
+        top: int | None = None,
     ) -> dict[str, Any]:
         """Run a single ARG query. Returns a dict with keys ``data`` and
-        (optional) ``skip_token`` for pagination."""
+        (optional) ``skip_token`` for pagination. ``top`` defaults to
+        the client's configured ``arg_page_size``."""
         from azure.core.exceptions import HttpResponseError
         from azure.mgmt.resourcegraph.models import (
             QueryRequest,
             QueryRequestOptions,
         )
 
+        top = top if top is not None else self._page_size
         options = QueryRequestOptions(top=top, skip_token=skip_token) if skip_token else QueryRequestOptions(top=top)
         request = QueryRequest(
             query=query,
@@ -89,9 +92,12 @@ class ResourceGraphClient:
             result["skip_token"] = skip
         return result
 
-    def iter_pages(self, query: str, *, top: int = 1000) -> Iterator[list[dict[str, Any]]]:
+    def iter_pages(
+        self, query: str, *, top: int | None = None,
+    ) -> Iterator[list[dict[str, Any]]]:
         """Drain all skip-token pages for a single query. Yields
-        ``data`` list per page."""
+        ``data`` list per page. ``top`` defaults to the client's
+        configured ``arg_page_size``."""
         skip: str | None = None
         while True:
             page = self.run_query(query, skip_token=skip, top=top)
