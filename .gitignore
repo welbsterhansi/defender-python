@@ -31,3 +31,6 @@ expand.csv
 # Local planning notes
 NOTES.md
 logs/
+
+# Smoke test outputs (ISSUE-002 P0 validation) — contain real tenant data
+smoke_out/

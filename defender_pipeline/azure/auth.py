@@ -41,7 +41,7 @@ def get_subscription_ids() -> list[str]:
     accessible subs).
     """
     try:
-        from azure.mgmt.resource import SubscriptionClient
+        from azure.mgmt.resource import SubscriptionClient  # type: ignore[import-not-found]
     except ImportError:
         return []
     try:

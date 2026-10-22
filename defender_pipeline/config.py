@@ -28,6 +28,9 @@ class Config:
     # ARG endpoint — the P2-validated api-version.
     arg_api_version: str = "2022-10-01"
 
+    # ARG pagination — max rows per skip-token page (ARG caps at 1000).
+    arg_page_size: int = 1000
+
 
 def from_env() -> Config:
     """Build a :class:`Config` overriding defaults from env vars."""
@@ -43,4 +46,10 @@ def from_env() -> Config:
             os.environ.get("DEFENDER_PIPELINE_TIMEOUT_S", "60"),
         ),
         retry_total=int(os.environ.get("DEFENDER_PIPELINE_RETRIES", "3")),
+        arg_api_version=os.environ.get(
+            "DEFENDER_PIPELINE_ARG_API_VERSION", "2022-10-01",
+        ),
+        arg_page_size=int(
+            os.environ.get("DEFENDER_PIPELINE_ARG_PAGE_SIZE", "1000"),
+        ),
     )

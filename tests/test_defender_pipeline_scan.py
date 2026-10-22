@@ -18,6 +18,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -88,6 +89,53 @@ class TestKqlBuilders:
     def test_scope_filter_empty_when_no_args(self) -> None:
         from defender_pipeline.azure.queries import build_scope_filter
         assert build_scope_filter() == ""
+
+    # ─── ISSUE-002 P0.1 — total-order `order by` after distinct ──────────
+    # Without a total ordering ARG skip-token pagination may duplicate or
+    # omit rows across pages (Microsoft docs). The order-by key must make
+    # rows unique.
+
+    def test_enumerate_query_has_total_order_by(self) -> None:
+        from defender_pipeline.azure.queries import build_enumerate_digests_query
+        kql = build_enumerate_digests_query("")
+        # Must appear AFTER distinct, otherwise ordering happens before
+        # dedup and doesn't help page stability.
+        distinct_idx = kql.index("distinct _repository, _digest")
+        order_idx = kql.index("| order by")
+        assert order_idx > distinct_idx, (
+            "`order by` must come after `distinct` so dedup happens first"
+        )
+        # Key = (_repository, _digest) is already the distinct tuple,
+        # so ordering on both gives a total order over emitted rows.
+        assert "_repository" in kql[order_idx:order_idx + 200]
+        assert "_digest" in kql[order_idx:order_idx + 200]
+
+    def test_batched_assessments_query_has_total_order_by(self) -> None:
+        from defender_pipeline.azure.queries import build_batched_assessments_query
+        kql = build_batched_assessments_query(["sha256:aaa"])
+        distinct_idx = kql.index("| distinct")
+        order_idx = kql.index("| order by")
+        assert order_idx > distinct_idx, (
+            "`order by` must come after `distinct`"
+        )
+        # Identity tuple for an assessment row = (repository, digest, cveId,
+        # packageName). Ordering by these makes the per-page cursor stable
+        # even if the service reorders rows that differ only on attributes.
+        tail = kql[order_idx:]
+        for key in ("repository", "digest", "cveId", "packageName"):
+            assert key in tail, f"order by must include {key}"
+
+    def test_batched_cvedetails_query_has_total_order_by(self) -> None:
+        from defender_pipeline.azure.queries import build_batched_cvedetails_query
+        kql = build_batched_cvedetails_query(["CVE-2024-1"])
+        # cvedetails ends with `project` after `summarize by cveIdJoin`,
+        # so cveIdJoin is already unique per emitted row.
+        summarize_idx = kql.index("summarize")
+        order_idx = kql.index("| order by")
+        assert order_idx > summarize_idx, (
+            "`order by` must come after `summarize ... by cveIdJoin`"
+        )
+        assert "cveIdJoin" in kql[order_idx:order_idx + 200]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -226,9 +274,9 @@ class TestEnrichmentRowParsing:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def _mk_assessment(**kwargs):
+def _mk_assessment(**kwargs: Any):
     from defender_pipeline.findings.models import AssessmentRow
-    defaults = dict(
+    defaults: dict[str, Any] = dict(
         repository="repo", digest="sha256:aaa", cve_id="CVE-2024-1",
         package_name="openssl", current_version="1.0", fixed_version="2.0",
         fix_status="FixAvailable", package_category="OS",
@@ -239,9 +287,9 @@ def _mk_assessment(**kwargs):
     return AssessmentRow(**defaults)
 
 
-def _mk_enrichment(**kwargs):
+def _mk_enrichment(**kwargs: Any):
     from defender_pipeline.findings.models import EnrichmentRow
-    defaults = dict(
+    defaults: dict[str, Any] = dict(
         cve_id_join="CVE-2024-1", cvss=9.8,
         published_date="2024-05-01T00:00:00Z", severity="Critical",
         verified=1, publicly_disclosed=1, in_exploit_kit=1,
@@ -464,7 +512,7 @@ class TestScanOrchestrator:
                 acr_name="mock-acr", min_score=0, max_score=10,
                 skip_tags=True, output=out,
             ),
-            arg_client=arg,
+            arg_client=arg,  # type: ignore[arg-type]  # duck-typed mock
         )
         assert rows == 1
         content = out.read_text(encoding="utf-8")
@@ -483,7 +531,7 @@ class TestScanOrchestrator:
         out = tmp_path / "empty.csv"
         rows = run_scan(
             ScanOptions(acr_name="x", skip_tags=True, output=out),
-            arg_client=arg,
+            arg_client=arg,  # type: ignore[arg-type]  # duck-typed mock
         )
         assert rows == 0
         lines = out.read_text().splitlines()
@@ -535,6 +583,497 @@ class TestResourceGraphClientApiVersion:
         _, kwargs = sdk_mock.call_args
         assert kwargs.get("api_version") == "2024-04-01"
 
+    def test_page_size_defaults_to_1000(self) -> None:
+        """arg_page_size default is forwarded to run_query as ``top``."""
+        from defender_pipeline.azure.resource_graph import ResourceGraphClient
+
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            client = ResourceGraphClient(credential=MagicMock())
+            # Simulate a single page then no skip_token.
+            sdk_mock.return_value.resources.return_value = MagicMock(
+                data=[], skip_token=None,
+            )
+            list(client.iter_pages("print 1"))
+
+        # resources() receives a QueryRequest with options.top = 1000.
+        _, kwargs = sdk_mock.return_value.resources.call_args
+        request = kwargs.get("request") or sdk_mock.return_value.resources.call_args[0][0]
+        assert request.options.top == 1000
+
+    def test_page_size_from_custom_config(self) -> None:
+        from defender_pipeline.azure.resource_graph import ResourceGraphClient
+        from defender_pipeline.config import Config
+
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            client = ResourceGraphClient(
+                credential=MagicMock(),
+                config=Config(arg_page_size=250),
+            )
+            sdk_mock.return_value.resources.return_value = MagicMock(
+                data=[], skip_token=None,
+            )
+            list(client.iter_pages("print 1"))
+
+        request = sdk_mock.return_value.resources.call_args[0][0]
+        assert request.options.top == 250
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ISSUE-002 P0.2 — run_query must expose SDK completeness signals so
+# iter_pages (P0.3) can validate that the drain actually completed.
+# The ARG QueryResponse carries total_records, count, result_truncated
+# alongside data/skip_token; the wrapper was dropping them.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestRunQueryCompletenessSignals:
+    @staticmethod
+    def _build_client(sdk_mock: MagicMock, *, response: MagicMock):
+        from defender_pipeline.azure.resource_graph import ResourceGraphClient
+        sdk_mock.return_value.resources.return_value = response
+        return ResourceGraphClient(credential=MagicMock())
+
+    def test_run_query_preserves_total_records(self) -> None:
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            response = MagicMock(
+                data=[{"x": 1}], skip_token=None,
+                total_records=12345, count=1, result_truncated="false",
+            )
+            client = self._build_client(sdk_mock, response=response)
+            result = client.run_query("print 1")
+        assert result["total_records"] == 12345
+
+    def test_run_query_preserves_count(self) -> None:
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            response = MagicMock(
+                data=[{"x": 1}, {"x": 2}], skip_token=None,
+                total_records=2, count=2, result_truncated="false",
+            )
+            client = self._build_client(sdk_mock, response=response)
+            result = client.run_query("print 1")
+        # count == rows returned in THIS response (not total).
+        assert result["count"] == 2
+
+    def test_run_query_normalises_result_truncated_true(self) -> None:
+        """SDK may return str 'true'/'false' or ResultTruncated enum.
+        Wrapper normalises to bool so callers don't need to care."""
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            response = MagicMock(
+                data=[], skip_token=None,
+                total_records=0, count=0, result_truncated="true",
+            )
+            client = self._build_client(sdk_mock, response=response)
+            result = client.run_query("print 1")
+        assert result["result_truncated"] is True
+
+    def test_run_query_normalises_result_truncated_false(self) -> None:
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            response = MagicMock(
+                data=[], skip_token=None,
+                total_records=0, count=0, result_truncated="false",
+            )
+            client = self._build_client(sdk_mock, response=response)
+            result = client.run_query("print 1")
+        assert result["result_truncated"] is False
+
+    def test_run_query_backward_compat_data_and_skip_token(self) -> None:
+        """Must NOT regress the existing contract: callers that only
+        look at data/skip_token keep working."""
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            response = MagicMock(
+                data=[{"a": 1}], skip_token="TOK",
+                total_records=1, count=1, result_truncated="false",
+            )
+            client = self._build_client(sdk_mock, response=response)
+            result = client.run_query("print 1")
+        assert result["data"] == [{"a": 1}]
+        assert result["skip_token"] == "TOK"
+
+    def test_run_query_handles_missing_sdk_fields_defensively(self) -> None:
+        """Older SDK responses may lack one of the completeness fields.
+        Wrapper must not crash — it should default sensibly:
+          total_records → None (unknown)
+          count         → len(data) (we can derive it)
+          result_truncated → False (treat as 'unknown' == not truncated)
+        """
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            # Build a response WITHOUT the new fields.
+            response = MagicMock(spec=["data", "skip_token"])
+            response.data = [{"a": 1}, {"b": 2}]
+            response.skip_token = None
+            client = self._build_client(sdk_mock, response=response)
+            result = client.run_query("print 1")
+        assert result["total_records"] is None
+        assert result["count"] == 2
+        assert result["result_truncated"] is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ISSUE-002 P0.3 — iter_pages must validate completeness end-to-end.
+# All-or-nothing: on silent loss (collected != total_records OR
+# result_truncated=true without skip_token) retry the full drain; on
+# persistent divergence raise CompletenessError — never yield partial.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _make_sdk_response(
+    *, data: list, skip_token: str | None,
+    total_records: int, result_truncated: str = "false",
+) -> MagicMock:
+    """Build a mock ARG response with all completeness fields set."""
+    return MagicMock(
+        data=data, skip_token=skip_token,
+        total_records=total_records, count=len(data),
+        result_truncated=result_truncated,
+    )
+
+
+class TestIterPagesCompletenessInvariant:
+    @staticmethod
+    def _client_with_pages(sdk_mock: MagicMock, pages: list[MagicMock]):
+        """Configure the SDK mock to return the given page sequence on
+        successive resources() calls. Infinite tail returns an empty
+        no-skip page to catch over-draining bugs."""
+        from defender_pipeline.azure.resource_graph import ResourceGraphClient
+        empty_tail = _make_sdk_response(
+            data=[], skip_token=None, total_records=0,
+        )
+        sdk_mock.return_value.resources.side_effect = pages + [empty_tail] * 100
+        return ResourceGraphClient(credential=MagicMock())
+
+    def test_happy_path_multipage_total_records_matches(self) -> None:
+        """total_records=5 across 3 pages → drain succeeds, no retry."""
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            pages = [
+                _make_sdk_response(data=[{"i": 1}, {"i": 2}],
+                                   skip_token="t1", total_records=5),
+                _make_sdk_response(data=[{"i": 3}, {"i": 4}],
+                                   skip_token="t2", total_records=5),
+                _make_sdk_response(data=[{"i": 5}],
+                                   skip_token=None, total_records=5),
+            ]
+            client = self._client_with_pages(sdk_mock, pages)
+            collected = list(client.iter_pages("print 1"))
+        rows = [row for page in collected for row in page]
+        assert len(rows) == 5
+        # Exactly 3 SDK calls — no retry needed.
+        assert sdk_mock.return_value.resources.call_count == 3
+
+    def test_total_records_mismatch_raises_completeness_error(self) -> None:
+        """collected < total_records → silent loss. Must raise after retries."""
+        from defender_pipeline.azure.resource_graph import CompletenessError
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            # Server says 10, we only receive 3.
+            drop_page = _make_sdk_response(
+                data=[{"i": 1}, {"i": 2}, {"i": 3}],
+                skip_token=None, total_records=10,
+            )
+            # All retry attempts hit the same broken response.
+            sdk_mock.return_value.resources.side_effect = [drop_page] * 10
+            from defender_pipeline.azure.resource_graph import ResourceGraphClient
+            client = ResourceGraphClient(credential=MagicMock())
+            with pytest.raises(CompletenessError) as exc:
+                list(client.iter_pages("print 1", max_drain_retries=2))
+        assert "3" in str(exc.value)
+        assert "10" in str(exc.value)
+
+    def test_truncated_without_skip_token_raises(self) -> None:
+        """result_truncated=true with no skip_token = ARG stopped mid-stream.
+        Must raise — this is silent loss."""
+        from defender_pipeline.azure.resource_graph import CompletenessError
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            trunc_page = _make_sdk_response(
+                data=[{"i": 1}], skip_token=None,
+                total_records=1, result_truncated="true",
+            )
+            sdk_mock.return_value.resources.side_effect = [trunc_page] * 10
+            from defender_pipeline.azure.resource_graph import ResourceGraphClient
+            client = ResourceGraphClient(credential=MagicMock())
+            with pytest.raises(CompletenessError) as exc:
+                list(client.iter_pages("print 1", max_drain_retries=2))
+        assert "truncated" in str(exc.value).lower()
+
+    def test_truncated_true_with_skip_token_is_fine(self) -> None:
+        """result_truncated=true WITH skip_token is normal (there is more).
+        Only the final page's truncated flag matters."""
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            pages = [
+                _make_sdk_response(data=[{"i": 1}], skip_token="t1",
+                                   total_records=2, result_truncated="true"),
+                _make_sdk_response(data=[{"i": 2}], skip_token=None,
+                                   total_records=2, result_truncated="false"),
+            ]
+            client = self._client_with_pages(sdk_mock, pages)
+            rows = [r for p in client.iter_pages("print 1") for r in p]
+        assert len(rows) == 2
+
+    def test_sdk_without_total_records_skips_count_validation(self) -> None:
+        """Legacy SDK responses may not send total_records. Wrapper
+        must not raise just because the signal is missing — only
+        validate what we have."""
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            # Response WITHOUT total_records (spec limits attributes).
+            legacy_page = MagicMock(spec=["data", "skip_token"])
+            legacy_page.data = [{"i": 1}, {"i": 2}]
+            legacy_page.skip_token = None
+            sdk_mock.return_value.resources.side_effect = [legacy_page]
+            from defender_pipeline.azure.resource_graph import ResourceGraphClient
+            client = ResourceGraphClient(credential=MagicMock())
+            rows = [r for p in client.iter_pages("print 1") for r in p]
+        assert len(rows) == 2  # no CompletenessError raised
+
+    def test_divergence_then_success_does_not_raise(self) -> None:
+        """First drain diverges (collected != total_records); second drain
+        succeeds. iter_pages must transparently retry and yield only
+        the successful attempt's data."""
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            # Attempt 1: one page, collected=1, total_records=2 → divergent
+            bad_page = _make_sdk_response(
+                data=[{"i": 1}], skip_token=None, total_records=2,
+            )
+            # Attempt 2: two pages, collected=2, total_records=2 → ok
+            good_1 = _make_sdk_response(
+                data=[{"i": 1}], skip_token="t1", total_records=2,
+            )
+            good_2 = _make_sdk_response(
+                data=[{"i": 2}], skip_token=None, total_records=2,
+            )
+            sdk_mock.return_value.resources.side_effect = [bad_page, good_1, good_2]
+            from defender_pipeline.azure.resource_graph import ResourceGraphClient
+            client = ResourceGraphClient(credential=MagicMock())
+            rows = [r for p in client.iter_pages(
+                "print 1", max_drain_retries=2,
+            ) for r in p]
+        # Yielded only the good attempt (2 rows, not 1+2=3).
+        assert len(rows) == 2
+        assert rows == [{"i": 1}, {"i": 2}]
+
+    def test_no_partial_yield_on_failure(self) -> None:
+        """Critical safety: if all retries fail, iter_pages must NOT
+        have yielded any data to the caller. Fail-closed guarantee."""
+        from defender_pipeline.azure.resource_graph import CompletenessError
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            bad = _make_sdk_response(
+                data=[{"i": 1}], skip_token=None, total_records=99,
+            )
+            sdk_mock.return_value.resources.side_effect = [bad] * 10
+            from defender_pipeline.azure.resource_graph import ResourceGraphClient
+            client = ResourceGraphClient(credential=MagicMock())
+
+            yielded: list = []
+            with pytest.raises(CompletenessError):
+                for page in client.iter_pages("print 1", max_drain_retries=1):
+                    yielded.extend(page)
+        assert yielded == [], (
+            "fail-closed violated: iter_pages yielded data despite "
+            "persistent completeness divergence"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ISSUE-002 P0.4 — iter_pages at realistic scale (>1000 rows across many
+# pages) with adversarial scenarios. ARG page cap is 1000, so a 12k-digest
+# scan traverses ~12 pages per batch. Tests here use synthetic fixtures
+# large enough that bugs that only manifest under multiple-page skip-token
+# chains have room to surface.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _synthetic_rows(n: int, prefix: str = "row") -> list[dict[str, int | str]]:
+    """Generate N unique synthetic rows. Each row has an ``i`` int index
+    and a ``k`` string key — the two together make a unique identity
+    pair that callers can compare set-of-keys between runs."""
+    return [{"i": idx, "k": f"{prefix}-{idx:06d}"} for idx in range(n)]
+
+
+def _paginate(
+    rows: list[dict], page_size: int, *, total_records: int | None = None,
+) -> list[MagicMock]:
+    """Split ``rows`` into SDK response mocks of ``page_size``. Each
+    response carries the FULL rows count as ``total_records`` by default
+    (what a real ARG query would do). Caller can override to simulate
+    divergent server-declared totals."""
+    total = total_records if total_records is not None else len(rows)
+    if not rows:
+        return [_make_sdk_response(data=[], skip_token=None, total_records=total)]
+    pages: list[MagicMock] = []
+    for i in range(0, len(rows), page_size):
+        chunk = rows[i:i + page_size]
+        is_last = (i + page_size) >= len(rows)
+        pages.append(_make_sdk_response(
+            data=chunk,
+            skip_token=None if is_last else f"tok_{i // page_size}",
+            total_records=total,
+        ))
+    return pages
+
+
+class TestIterPagesAtScale:
+    """Fixtures: ARG page cap is 1000, so these use >=1500 rows to force
+    at least 2 pages at page_size=1000 and multiple pages at smaller sizes."""
+
+    def test_scale_1500_rows_three_pages_happy_path(self) -> None:
+        rows = _synthetic_rows(1500)
+        pages = _paginate(rows, page_size=500)
+        assert len(pages) == 3, "fixture precondition: 3 pages"
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            sdk_mock.return_value.resources.side_effect = pages
+            from defender_pipeline.azure.resource_graph import ResourceGraphClient
+            client = ResourceGraphClient(credential=MagicMock())
+            collected = [r for p in client.iter_pages("print 1") for r in p]
+        assert len(collected) == 1500
+        # Order preserved from ARG; no dedup inside iter_pages.
+        assert collected[0]["i"] == 0 and collected[-1]["i"] == 1499
+        assert sdk_mock.return_value.resources.call_count == 3
+
+    def test_scale_total_records_overshoot_duplicate_detected(self) -> None:
+        """ARG duplicates a row across pages: collected (1500+1) !=
+        total_records (1500) → divergence → fail closed after retries."""
+        from defender_pipeline.azure.resource_graph import CompletenessError
+        rows = _synthetic_rows(1500)
+        pages = _paginate(rows, page_size=500)
+        # Inject a duplicate into page 2 — mimics ARG reordering causing
+        # the same row to appear across skip-token boundaries.
+        dup_row = rows[42]
+        pages[1].data = [*list(pages[1].data), dup_row]
+        pages[1].count = len(pages[1].data)
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            # All retries hit the same broken sequence.
+            sdk_mock.return_value.resources.side_effect = pages * 10
+            from defender_pipeline.azure.resource_graph import ResourceGraphClient
+            client = ResourceGraphClient(credential=MagicMock())
+            with pytest.raises(CompletenessError) as exc:
+                list(client.iter_pages("print 1", max_drain_retries=1))
+        # Error message must carry both numbers so operators can triage.
+        assert "1501" in str(exc.value)
+        assert "1500" in str(exc.value)
+
+    def test_scale_skip_token_dropped_prematurely_detected(self) -> None:
+        """ARG stops serving pages before the full result set is drained:
+        last page omits skip_token even though total_records says there's
+        more. Must raise."""
+        from defender_pipeline.azure.resource_graph import CompletenessError
+        rows = _synthetic_rows(1500)
+        pages = _paginate(rows, page_size=500)  # 3 real pages
+        # Simulate ARG stopping after page 2 by dropping skip_token on page 2.
+        pages[1].skip_token = None
+        # Only pages[0] and pages[1] will be fetched; pages[2] never.
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            # Each retry resets to the same broken behaviour.
+            sdk_mock.return_value.resources.side_effect = (
+                [pages[0], pages[1]] * 10
+            )
+            from defender_pipeline.azure.resource_graph import ResourceGraphClient
+            client = ResourceGraphClient(credential=MagicMock())
+            with pytest.raises(CompletenessError) as exc:
+                list(client.iter_pages("print 1", max_drain_retries=1))
+        # collected = 1000, total_records = 1500 → silent loss
+        assert "1000" in str(exc.value)
+        assert "1500" in str(exc.value)
+
+    def test_scale_divergence_then_success_at_1500_rows(self) -> None:
+        """First drain diverges (short), second drain completes.
+        iter_pages must retry transparently and yield only the clean run."""
+        rows = _synthetic_rows(1500)
+        bad_pages = _paginate(rows[:900], page_size=500,
+                              total_records=1500)  # claims 1500, gives 900
+        good_pages = _paginate(rows, page_size=500)
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            sdk_mock.return_value.resources.side_effect = (
+                bad_pages + good_pages
+            )
+            from defender_pipeline.azure.resource_graph import ResourceGraphClient
+            client = ResourceGraphClient(credential=MagicMock())
+            collected = [
+                r for p in client.iter_pages("print 1", max_drain_retries=2)
+                for r in p
+            ]
+        # Only the successful attempt's 1500 rows — not 900+1500.
+        assert len(collected) == 1500
+        indices = [r["i"] for r in collected]
+        assert indices[0] == 0 and indices[-1] == 1499
+
+    def test_scale_two_runs_same_scope_match_by_unique_key(self) -> None:
+        """Comparison-by-key between two runs of the same scope: the SET
+        of unique keys must be identical. Protects against the client's
+        observed failure mode (run A had 314 rows, run B had 149; the
+        incident surfaced only via diff, never via count)."""
+        rows = _synthetic_rows(2500)
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            sdk_mock.return_value.resources.side_effect = (
+                _paginate(rows, page_size=700)   # 4 pages for run A
+                + _paginate(rows, page_size=700)  # 4 pages for run B
+            )
+            from defender_pipeline.azure.resource_graph import ResourceGraphClient
+            client = ResourceGraphClient(credential=MagicMock())
+            run_a = [r for p in client.iter_pages("same query") for r in p]
+            run_b = [r for p in client.iter_pages("same query") for r in p]
+        keys_a = {row["k"] for row in run_a}
+        keys_b = {row["k"] for row in run_b}
+        assert len(run_a) == len(run_b) == 2500
+        assert keys_a == keys_b, (
+            f"two runs disagreed on {len(keys_a ^ keys_b)} unique keys "
+            f"(set-symmetric-difference) despite matching counts"
+        )
+
+    def test_scale_mutation_between_pages_declared_total_wins(self) -> None:
+        """Server declares total_records=1500 on page 1 but changes to
+        1550 on page 2 (data mutated mid-drain). iter_pages locks in the
+        first-page total — subsequent pages' total_records changes are
+        ignored for the invariant check. If actual collected matches the
+        LOCKED total, success. This documents the ARG snapshot limit:
+        iter_pages catches silent loss relative to the FIRST page's view."""
+        rows = _synthetic_rows(1500)
+        pages = _paginate(rows, page_size=500)  # 3 pages, each total=1500
+        # Simulate dataset growing: later pages report a higher total.
+        pages[1].total_records = 1550
+        pages[2].total_records = 1550
+        with patch("azure.mgmt.resourcegraph.ResourceGraphClient") as sdk_mock:
+            sdk_mock.return_value.resources.side_effect = pages
+            from defender_pipeline.azure.resource_graph import ResourceGraphClient
+            client = ResourceGraphClient(credential=MagicMock())
+            collected = [r for p in client.iter_pages("print 1") for r in p]
+        # We received 1500 rows, and expected locked = 1500 → pass.
+        # (The real limit here is documented: ARG does not promise
+        # snapshot consistency, see ISSUE-002.)
+        assert len(collected) == 1500
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Config.from_env — env-var overrides for ARG settings
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestConfigFromEnv:
+    """Guard the env-var contract — operators ship values via env, not
+    code edits. The arg_api_version override specifically prevents the
+    reintroduction of the 2021-03-01 bug by letting ops pin a newer
+    api-version without a release."""
+
+    def test_arg_api_version_env_override(self, monkeypatch) -> None:
+        from defender_pipeline.config import from_env
+        monkeypatch.setenv("DEFENDER_PIPELINE_ARG_API_VERSION", "2024-04-01")
+        cfg = from_env()
+        assert cfg.arg_api_version == "2024-04-01"
+
+    def test_arg_api_version_default_is_2022_10_01(self, monkeypatch) -> None:
+        from defender_pipeline.config import from_env
+        monkeypatch.delenv("DEFENDER_PIPELINE_ARG_API_VERSION", raising=False)
+        cfg = from_env()
+        assert cfg.arg_api_version == "2022-10-01"
+
+    def test_arg_page_size_env_override(self, monkeypatch) -> None:
+        from defender_pipeline.config import from_env
+        monkeypatch.setenv("DEFENDER_PIPELINE_ARG_PAGE_SIZE", "250")
+        cfg = from_env()
+        assert cfg.arg_page_size == 250
+
+    def test_arg_page_size_default_is_1000(self, monkeypatch) -> None:
+        from defender_pipeline.config import from_env
+        monkeypatch.delenv("DEFENDER_PIPELINE_ARG_PAGE_SIZE", raising=False)
+        cfg = from_env()
+        assert cfg.arg_page_size == 1000
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # _translate_arg_error — ARG exception hardening
@@ -552,9 +1091,13 @@ class TestTranslateArgError:
         """Build a minimal Azure-SDK-shaped exception. Plain classes
         (not MagicMock) so ``__str__`` and attribute shape are honest."""
         class _Error:
-            pass
+            code: Any = None
+            details: Any = None
 
         class _Exc(Exception):
+            status_code: Any = None
+            error: Any = None
+
             def __init__(self):
                 super().__init__(message)
             def __str__(self):
@@ -574,7 +1117,7 @@ class TestTranslateArgError:
     def _detail(self, code: str):
         """ODataV4Format-shaped detail (has .code attribute)."""
         class _D:
-            pass
+            code: Any = None
         d = _D()
         d.code = code
         return d

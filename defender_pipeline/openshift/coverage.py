@@ -10,10 +10,10 @@ See ``docs/contracts/resultado_cruzamento.md`` and
 """
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 
 
-class CoverageState(str, Enum):
+class CoverageState(StrEnum):
     """Per-namespace classification."""
 
     SUCCESS_WITH_PODS = "SUCCESS_WITH_PODS"
@@ -28,7 +28,7 @@ class CoverageState(str, Enum):
         return self in (CoverageState.SUCCESS_WITH_PODS, CoverageState.NO_PODS)
 
 
-class Coverage(str, Enum):
+class Coverage(StrEnum):
     """Overall run coverage — determines the process exit code."""
 
     COMPLETE = "COMPLETE"

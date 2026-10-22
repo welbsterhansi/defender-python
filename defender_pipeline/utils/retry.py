@@ -68,9 +68,12 @@ def arg_call_retry(func: Callable[..., Any]) -> Callable[..., Any]:
             "tenacity is required for retry policies — install extras: "
             "pip install -e .[pipeline]",
         )
-    return retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception(_is_retryable),
+    # tenacity names are bound only when the top-of-module try/except
+    # succeeded (_TENACITY_AVAILABLE guard above re-raises otherwise),
+    # so these are safe. Pyright can't see across the ImportError guard.
+    return retry(  # type: ignore[possibly-unbound]
+        stop=stop_after_attempt(3),  # type: ignore[possibly-unbound]
+        wait=wait_exponential(multiplier=1, min=1, max=10),  # type: ignore[possibly-unbound]
+        retry=retry_if_exception(_is_retryable),  # type: ignore[possibly-unbound]
         reraise=True,
     )(func)
