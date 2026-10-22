@@ -14,6 +14,7 @@ real behavior tests once the stubs get filled in.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -80,7 +81,7 @@ def _run_module(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, "-m", "defender_pipeline", *args],
         cwd=REPO_ROOT,
-        env={"PYTHONPATH": env_pypath, "PATH": subprocess.os.environ.get("PATH", "")},
+        env={"PYTHONPATH": env_pypath, "PATH": os.environ.get("PATH", "")},
         capture_output=True,
         text=True,
         check=False,

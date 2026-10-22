@@ -18,6 +18,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -273,9 +274,9 @@ class TestEnrichmentRowParsing:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def _mk_assessment(**kwargs):
+def _mk_assessment(**kwargs: Any):
     from defender_pipeline.findings.models import AssessmentRow
-    defaults = dict(
+    defaults: dict[str, Any] = dict(
         repository="repo", digest="sha256:aaa", cve_id="CVE-2024-1",
         package_name="openssl", current_version="1.0", fixed_version="2.0",
         fix_status="FixAvailable", package_category="OS",
@@ -286,9 +287,9 @@ def _mk_assessment(**kwargs):
     return AssessmentRow(**defaults)
 
 
-def _mk_enrichment(**kwargs):
+def _mk_enrichment(**kwargs: Any):
     from defender_pipeline.findings.models import EnrichmentRow
-    defaults = dict(
+    defaults: dict[str, Any] = dict(
         cve_id_join="CVE-2024-1", cvss=9.8,
         published_date="2024-05-01T00:00:00Z", severity="Critical",
         verified=1, publicly_disclosed=1, in_exploit_kit=1,
@@ -511,7 +512,7 @@ class TestScanOrchestrator:
                 acr_name="mock-acr", min_score=0, max_score=10,
                 skip_tags=True, output=out,
             ),
-            arg_client=arg,
+            arg_client=arg,  # type: ignore[arg-type]  # duck-typed mock
         )
         assert rows == 1
         content = out.read_text(encoding="utf-8")
@@ -530,7 +531,7 @@ class TestScanOrchestrator:
         out = tmp_path / "empty.csv"
         rows = run_scan(
             ScanOptions(acr_name="x", skip_tags=True, output=out),
-            arg_client=arg,
+            arg_client=arg,  # type: ignore[arg-type]  # duck-typed mock
         )
         assert rows == 0
         lines = out.read_text().splitlines()
@@ -1090,9 +1091,13 @@ class TestTranslateArgError:
         """Build a minimal Azure-SDK-shaped exception. Plain classes
         (not MagicMock) so ``__str__`` and attribute shape are honest."""
         class _Error:
-            pass
+            code: Any = None
+            details: Any = None
 
         class _Exc(Exception):
+            status_code: Any = None
+            error: Any = None
+
             def __init__(self):
                 super().__init__(message)
             def __str__(self):
@@ -1112,7 +1117,7 @@ class TestTranslateArgError:
     def _detail(self, code: str):
         """ODataV4Format-shaped detail (has .code attribute)."""
         class _D:
-            pass
+            code: Any = None
         d = _D()
         d.code = code
         return d

@@ -79,7 +79,7 @@ class TestErrorPaths:
         self, cruzamento_csv_new: Path, defender_csv_missing_columns: Path,
         tmp_path: Path,
     ) -> None:
-        with pytest.raises(ValueError, match="missing required defender.sh columns"):
+        with pytest.raises(ValueError, match=r"missing required defender\.sh columns"):
             run_expand(ExpandOptions(
                 cruzamento=cruzamento_csv_new,
                 vulnerabilities=defender_csv_missing_columns,
