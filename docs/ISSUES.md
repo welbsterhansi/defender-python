@@ -79,8 +79,9 @@ files.
 
 ## ISSUE-002 — Azure Resource Graph pagination not resilient at scale
 
-- **Status:** planned (tasks #5–#12). Headline fix (`order by`) also being
-  worked on an upstream branch; this issue tracks the full remediation.
+- **Status:** fixed on main — P0.1–P0.4 landed via branch
+  `fix/arg-pagination-resilience`. P1.1 (checkpoint + resume) and P1.2
+  (structured per-batch log) remain as planned follow-up (not blocking).
 - **Reported:** 2026-10-21 — client incident: `acr.csv` run with ~12k
   digests returned incomplete rows; a per-image rescan (`fad/financebatch:1.0.9v2`)
   produced 149 lines vs ~1 line previously. Loss was silent.
